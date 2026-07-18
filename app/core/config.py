@@ -28,6 +28,21 @@ class Settings(BaseSettings):
     APP_VERSION: str = "1.0.0"
     CORS_ORIGINS: list[str] = ["*"]
 
+    # --- TrueData (sandbox defaults; override via env in production) ---
+    # Trial credentials provided by TrueData — sandbox environment.
+    TRUEDATA_USERNAME: str = "Trial126"
+    TRUEDATA_PASSWORD: str = "sand126"
+    TRUEDATA_LIVE_PORT: int = 8086  # Real-Time + History trial port
+    TRUEDATA_URL: str = "push.truedata.in"
+    TRUEDATA_HIST_URL: str = "https://history.truedata.in"
+    # Hard ceiling on rows written per symbol into a single .xls sheet.
+    # BIFF8 .xls has a hard 65536-row limit; we default to 60000 to leave
+    # room for the header row.
+    TRUEDATA_MAX_ROWS_PER_SYMBOL: int = 60000
+    # Network timeout (seconds) for the full TrueData connect+fetch+disconnect
+    # cycle per request.
+    TRUEDATA_REQUEST_TIMEOUT_SEC: int = 60
+
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )

@@ -78,7 +78,12 @@ def create_app() -> FastAPI:
         for path in openapi_schema["paths"]:
             for method in openapi_schema["paths"][path]:
                 if method in {"get", "post", "put", "delete"}:
-                    if "/users/me" in path:
+                    # Mark every authenticated route with a Bearer lock icon
+                    # in Swagger UI. Add new protected path prefixes here.
+                    if any(
+                        protected_prefix in path
+                        for protected_prefix in ("/users/me", "/market-data/")
+                    ):
                         openapi_schema["paths"][path][method]["security"] = [
                             {"Bearer": []}
                         ]

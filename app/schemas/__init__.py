@@ -1,5 +1,11 @@
 """Re-export all schemas for convenient imports."""
 
+from app.schemas.market_data import (
+    BarSize,
+    Segment,
+    TrueDataExportRequest,
+    TrueDataExportResponseMeta,
+)
 from app.schemas.otp import DevOtpResponse, OTPRequest, OTPVerifyRequest
 from app.schemas.token import TokenData, TokenResponse
 from app.schemas.user import UserResponse
@@ -30,4 +36,8 @@ __all__ = [
     "TokenData",
     "RegisterRequest",
     "LoginRequest",
+    "BarSize",
+    "Segment",
+    "TrueDataExportRequest",
+    "TrueDataExportResponseMeta",
 ]
