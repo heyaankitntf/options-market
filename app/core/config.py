@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     OTP_LENGTH: int = 6
 
     # --- App ---
-    APP_NAME: str = "OTP Authentication System"
+    APP_NAME: str = "Options Trading"
     APP_VERSION: str = "1.0.0"
     CORS_ORIGINS: list[str] = ["*"]
 

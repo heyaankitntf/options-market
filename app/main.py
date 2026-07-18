@@ -32,7 +32,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title=settings.APP_NAME,
         version=settings.APP_VERSION,
-        description="OTP-based authentication microservice for OptionFlow.",
+        description="Options trading platform for OptionFlow.",
         lifespan=lifespan,
     )
 
@@ -55,7 +55,7 @@ def create_app() -> FastAPI:
 
     @app.get("/health", tags=["meta"])
     def health_check():
-        return {"status": "ok", "service": "otp-auth-system"}
+        return {"status": "ok", "service": "options-trading-platform"}
 
     # Custom OpenAPI schema with a Bearer security scheme so protected
     # endpoints render a lock icon in Swagger UI.
