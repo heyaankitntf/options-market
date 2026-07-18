@@ -54,6 +54,28 @@ Content-Type: application/json
 }
 ```
 
+### Symbol formats (verified against the trial account)
+
+Not all symbol conventions work in the trial account. Below is what we
+verified by probing TrueData on 2026-07-18.
+
+| Category | Working symbols | Notes |
+|----------|-----------------|-------|
+| **Indices** | `NIFTY 50`, `SENSEX`, `BANKEX` | Note the **space** in `NIFTY 50` — bare `NIFTY` returns empty |
+| **Index futures (continuous)** | `NIFTY-I`, `BANKNIFTY-I`, `FINNIFTY-I` | The `-I` suffix means "continuous front-month" |
+| **Commodity futures (continuous)** | `CRUDEOIL-I`, `GOLD-I`, `SILVER-I` | MCX segment |
+| **NSE Equity** | `SBIN`, `RELIANCE`, `TCS`, `INFY`, … | Plain ticker, no suffix |
+
+**Symbols that DON'T work in the trial** (return 502 from this endpoint):
+
+- Bare index names (`NIFTY`, `BANKNIFTY`) — use `NIFTY 50` or `NIFTY-I`
+- BSE equity with `-BE` suffix (`SBIN-BE`) — TrueData doesn't use the Zerodha convention
+- Option contracts (`NIFTY26JUL24000CE`) — trial doesn't include NSE F&O option history
+- Currency derivatives (`USDINR26JULFUT`) — not in trial segments
+
+Symbols are normalised (strip + uppercase + dedupe) before being sent to
+TrueData, so `" nifty-i "` and `"NIFTY-I"` are treated as the same symbol.
+
 ### Response
 
 `Content-Type: application/zip` — a ZIP containing:

@@ -14,12 +14,16 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 # Bar sizes accepted by the TrueData historical REST API. Values match the
 # strings the upstream SDK forwards verbatim to `getbars` / `getticks`.
+#
+# Verified against the trial account (2026-07-18): every value below returns
+# data successfully. TrueData also accepts case variants (e.g. `eod`) but we
+# normalise via the enum so the .xls filenames are deterministic.
 class BarSize(str, Enum):
     TICK = "tick"
     ONE_MIN = "1 min"
     FIVE_MIN = "5 min"
     FIFTEEN_MIN = "15 min"
-    THIRTY_MIN = "30 min"
+    THIRTY_MIN = "30 min"        # PyPI docs also use "30 mins" — both work server-side
     ONE_HOUR = "1 hour"
     EOD = "EOD"
 
@@ -49,9 +53,21 @@ class TrueDataExportRequest(BaseModel):
         ...,
         min_length=1,
         max_length=50,  # TrueData trial cap
-        description="List of TrueData contract symbols (e.g. NIFTY-I, "
-        "BANKNIFTY-I, RELIANCE). Trial accounts are capped at 50 symbols.",
-        examples=[["NIFTY-I", "BANKNIFTY-I"]],
+        description=(
+            "List of TrueData contract symbols. Trial accounts are capped at "
+            "50 symbols. Verified-working symbol formats in the trial:\n\n"
+            "  • Indices:          `NIFTY 50` (note the space), `SENSEX`, `BANKEX`\n"
+            "  • Index futures:    `NIFTY-I`, `BANKNIFTY-I`, `FINNIFTY-I`\n"
+            "  • Commodity futures:`CRUDEOIL-I`, `GOLD-I`, `SILVER-I`\n"
+            "  • NSE Equity:       `SBIN`, `RELIANCE`, `TCS`, `INFY`, …\n\n"
+            "Symbols that DON'T work in the trial:\n"
+            "  • Bare index names (`NIFTY`, `BANKNIFTY`) — use `NIFTY 50` or `NIFTY-I` instead\n"
+            "  • BSE equity with `-BE` suffix — TrueData doesn't use the Zerodha convention\n"
+            "  • Option contracts (`NIFTY26JUL24000CE`) — trial doesn't include NSE F&O history\n"
+            "  • Currency derivatives (`USDINR26JULFUT`) — not in trial segments\n\n"
+            "Symbols are normalised (strip + uppercase + dedupe) before fetching."
+        ),
+        examples=[["NIFTY-I", "BANKNIFTY-I"], ["SBIN", "RELIANCE", "TCS"], ["NIFTY 50", "SENSEX"]],
     )
     start_date: date = Field(
         ...,
