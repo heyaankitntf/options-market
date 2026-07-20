@@ -1,38 +1,51 @@
 """TrueData live tick streaming client.
 
-Wraps the official `truedata` SDK (v7+) `TD_live` class to capture real-time
+Wraps the official `truedata-ws` SDK (v5+) `TD` class to capture real-time
 trade ticks for a bounded duration and return them as per-symbol pandas
-DataFrames. Used by the `/api/v1/market-data/truedata/ticks/export` endpoint.
+DataFrames. Used by both the `/api/v1/market-data/truedata/ticks/export`
+(live) and `/api/v1/market-data/truedata/ticks/replay/export` (off-hours
+replay) endpoints.
 
-Why a separate service from `truedata_service.py`?
---------------------------------------------------
-The historical bars endpoint (`truedata_service.py`) uses `truedata_ws.TD` —
-a different SDK package with a different API surface (`get_historic_data`).
-The live tick endpoint uses `truedata.TD_live` which exposes decorator-based
-callbacks (`@td.full_feed_trade_callback`) for streaming ticks. The two SDKs
-cannot share a client object.
+Why v5 (`truedata_ws.TD`) without `full_feed=True`, and `@trade_callback`?
+------------------------------------------------------------------------
+We initially used v7's `TD_live` class, which works on the live socket but
+receives **zero trade ticks** on the replay socket (only touchline
+snapshots arrive). We then tried v5 with `full_feed=True` — also zero
+ticks, because `full_feed=True` triggers a master-contract download that
+the trial account can't complete and the SDK hangs in the constructor.
+
+The team lead's reference guide (TrueData's official "Full Market Feed
+Replay" KB article) shows the simple pattern: `TD(url='replay.truedata.in',
+live_port=8082)` without `full_feed=True`, register `@td.trade_callback`.
+This works on BOTH the live and replay sockets, receives all 19 fields the
+team lead asked for, and the SDK extracts `special_tag` from `raw_tick[13]`
+for us automatically (no manual indexing).
+
+The historical bars endpoint (`truedata_service.py`) also uses
+`truedata_ws.TD` — same SDK, just configured with `historical_api=True`.
 
 Hard-fail contract
 -------------------
 Any SDK error (connect failure, subscription rejection, unexpected exception
 in a callback) is re-raised as `TrueDataError`. The HTTP route maps that to
-HTTP 502. If 0 ticks are captured across ALL symbols (e.g. market is closed),
-we also raise `TrueDataError` so the caller gets a clear 502 instead of an
-empty ZIP.
+HTTP 502. If 0 ticks are captured across ALL symbols (e.g. market is closed
+on live, or replay socket is down), we also raise `TrueDataError` so the
+caller gets a clear 502 instead of an empty ZIP.
 
 Tick field map (matches the spec the API provider shared with the team)
 ----------------------------------------------------------------------
-Each captured tick is a `full_feed` dataclass instance. We project it onto
-the following flat columns in the .xls output:
+Each captured tick is a `tick_feed` dataclass instance (the SDK wraps the
+raw trade message and exposes typed attributes). We project it onto the
+following flat columns in the .xls output:
 
     symbol_id, timestamp, ltp, ltq, atp, ttq,
     day_open, day_high, day_low, prev_day_close,
     oi, prev_day_oi, turnover, special_tag, tick_seq,
     best_bid_price, best_bid_qty, best_ask_price, best_ask_qty
 
-The `special_tag` field lives at `raw_tick[13]` in the SDK's internal tuple
-(the SDK itself skips parsing this index — we extract it manually so the
-"O/H/L" / empty-string marker the team lead mentioned is preserved).
+The `special_tag` field is `""` on regular ticks, and `"O"`/`"H"`/`"L"` on
+ticks that establish a new session Open / High / Low. The SDK extracts it
+from `raw_tick[13]` automatically (see `TD_live.handle_trade_data`).
 """
 
 from __future__ import annotations
@@ -111,42 +124,40 @@ class _TickBuffer:
 
 
 def _tick_to_row(tick: Any) -> dict[str, Any]:
-    """Project a `full_feed` SDK tick object onto our flat row dict.
+    """Project an SDK tick object (`tick_feed` from `@trade_callback` or
+    `full_feed` from `@full_feed_trade_callback`) onto our flat row dict.
 
-    The SDK skips `raw_tick[13]` (the 'special tag' field — typically an
-    empty string, or "O"/"H"/"L" on session extreme ticks). We extract it
-    manually so the column the team lead asked for is populated.
+    Both dataclasses expose the same field names (ltp, ltq, atp, ttq,
+    day_open/high/low, prev_day_close, oi, prev_day_oi, turnover,
+    special_tag, tick_seq, best_bid/ask price+qty) — verified in the SDK
+    source at `truedata_ws/websocket/support.py`. We use `getattr` with
+    sensible defaults so a missing field doesn't blow up the whole capture.
+
+    The SDK extracts `special_tag` from `raw_tick[13]` for us on the
+    `tick_feed` path (see `TD_live.handle_trade_data` line 235), so no
+    manual `raw_tick` indexing is needed.
     """
-    # Most fields are direct attributes on the dataclass.
-    row: dict[str, Any] = {
-        "symbol_id": int(getattr(tick, "symbol_id", 0)),
+    return {
+        "symbol_id": int(getattr(tick, "symbol_id", 0) or 0),
         "timestamp": getattr(tick, "timestamp", None),
-        "ltp": float(getattr(tick, "ltp", 0.0)),
-        "ltq": int(getattr(tick, "ltq", 0)),
-        "atp": float(getattr(tick, "atp", 0.0)),
-        "ttq": float(getattr(tick, "ttq", 0.0)),
-        "day_open": float(getattr(tick, "day_open", 0.0)),
-        "day_high": float(getattr(tick, "day_high", 0.0)),
-        "day_low": float(getattr(tick, "day_low", 0.0)),
-        "prev_day_close": float(getattr(tick, "prev_day_close", 0.0)),
-        "oi": int(getattr(tick, "oi", 0)),
-        "prev_day_oi": int(getattr(tick, "prev_day_oi", 0)),
-        "turnover": float(getattr(tick, "turnover", 0.0)),
-        "tick_seq": int(getattr(tick, "tick_seq", 0)),
-        "best_bid_price": float(getattr(tick, "best_bid_price", 0.0)),
-        "best_bid_qty": int(getattr(tick, "best_bid_qty", 0)),
-        "best_ask_price": float(getattr(tick, "best_ask_price", 0.0)),
-        "best_ask_qty": int(getattr(tick, "best_ask_qty", 0)),
+        "ltp": float(getattr(tick, "ltp", 0.0) or 0.0),
+        "ltq": int(getattr(tick, "ltq", 0) or 0),
+        "atp": float(getattr(tick, "atp", 0.0) or 0.0),
+        "ttq": float(getattr(tick, "ttq", 0.0) or 0.0),
+        "day_open": float(getattr(tick, "day_open", 0.0) or 0.0),
+        "day_high": float(getattr(tick, "day_high", 0.0) or 0.0),
+        "day_low": float(getattr(tick, "day_low", 0.0) or 0.0),
+        "prev_day_close": float(getattr(tick, "prev_day_close", 0.0) or 0.0),
+        "oi": int(getattr(tick, "oi", 0) or 0),
+        "prev_day_oi": int(getattr(tick, "prev_day_oi", 0) or 0),
+        "turnover": float(getattr(tick, "turnover", 0.0) or 0.0),
+        "special_tag": str(getattr(tick, "special_tag", "") or ""),
+        "tick_seq": int(getattr(tick, "tick_seq", 0) or 0),
+        "best_bid_price": float(getattr(tick, "best_bid_price", 0.0) or 0.0),
+        "best_bid_qty": int(getattr(tick, "best_bid_qty", 0) or 0),
+        "best_ask_price": float(getattr(tick, "best_ask_price", 0.0) or 0.0),
+        "best_ask_qty": int(getattr(tick, "best_ask_qty", 0) or 0),
     }
-
-    # Extract the special_tag from raw_tick[13] — the SDK skips this index.
-    raw = getattr(tick, "raw_tick", None)
-    if isinstance(raw, (list, tuple)) and len(raw) > 13:
-        row["special_tag"] = str(raw[13]) if raw[13] is not None else ""
-    else:
-        row["special_tag"] = ""
-
-    return row
 
 
 @dataclass
@@ -198,11 +209,31 @@ def capture_ticks(
 
     # Lazy import so the SDK is only loaded when actually needed; this keeps
     # pytest collection fast for tests that don't touch TrueData.
+    #
+    # IMPORTANT — SDK usage pattern (matches TrueData's official replay guide):
+    # We use `truedata_ws.websocket.TD` WITHOUT the `full_feed=True` flag,
+    # and register `@td.trade_callback` to receive ticks.
+    #
+    # Why not `full_feed=True`?
+    #   The `full_feed=True` flag triggers a one-time master-contract download
+    #   (~2 minutes the first time each day) that the trial account appears
+    #   unable to complete — the SDK hangs in the constructor and never
+    #   receives ticks. The simpler pattern (no `full_feed`, `@trade_callback`)
+    #   works on BOTH the live and replay sockets, receives ALL 19 fields the
+    #   team lead asked for (ltp, ltq, atp, ttq, O/H/L, prev_close, OI,
+    #   prev_OI, turnover, special_tag, tick_seq, best_bid/ask price+qty),
+    #   and matches the team lead's reference guide verbatim.
+    #
+    # Why v5 (`truedata_ws.TD`) and not v7 (`truedata.TD_live`)?
+    #   The v7 `TD_live` class always operates in full-feed mode internally
+    #   and sends a subscription request the replay server doesn't honour —
+    #   we observed 0 trade ticks on the replay socket with v7. v5 lets us
+    #   opt out of full-feed mode and use the simple `@trade_callback` path.
     try:
-        from truedata import TD_live  # type: ignore
+        from truedata_ws.websocket.TD import TD  # type: ignore
     except ImportError as e:  # pragma: no cover - dependency is in requirements.txt
         raise TrueDataError(
-            "truedata package is not installed. Run `pip install -r requirements.txt`."
+            "truedata-ws package is not installed. Run `pip install -r requirements.txt`."
         ) from e
 
     # Select URL/port based on replay mode. We do NOT time-validate here —
@@ -227,17 +258,20 @@ def capture_ticks(
         mode_label, symbols, duration_seconds, ws_url, ws_port,
     )
 
+    # We pass `historical_api=False` because we never use the REST history
+    # client from this service — it saves a TCP connection and ~150ms.
     try:
-        td = TD_live(
+        td = TD(
             login_id=settings.TRUEDATA_USERNAME,
             password=settings.TRUEDATA_PASSWORD,
             url=ws_url,
             live_port=ws_port,
+            historical_api=False,
             log_level=logging.WARNING,
         )
     except Exception as e:
         raise TrueDataError(
-            f"Failed to create TD_live client: {type(e).__name__}: {e}"
+            f"Failed to create TD client: {type(e).__name__}: {e}"
         ) from e
 
     try:
@@ -248,11 +282,12 @@ def capture_ticks(
         ) from e
 
     try:
-        # Register the full-feed trade callback. We use full_feed (not the
-        # narrower trade_callback) because it carries every field the team
-        # lead asked for, including best_bid/ask which the narrow trade_tick
-        # object doesn't expose.
-        @td.full_feed_trade_callback  # type: ignore[misc]
+        # Register the trade callback. The SDK passes a `tick_feed` dataclass
+        # with the same field names as `full_feed` (ltp, ltq, best_bid_price,
+        # best_bid_qty, special_tag, tick_seq, etc.) — so `_tick_to_row()`
+        # works unchanged. The SDK extracts `special_tag` from raw_tick[13]
+        # for us; no manual parsing needed.
+        @td.trade_callback  # type: ignore[misc]
         def _on_tick(tick: Any) -> None:  # noqa: ANN001 - SDK passes its own dataclass
             sym = getattr(tick, "symbol", None)
             if sym is None or sym not in buffers:
