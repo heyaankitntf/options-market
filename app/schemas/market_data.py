@@ -129,3 +129,102 @@ class TrueDataExportResponseMeta(BaseModel):
     files: list[str]  # filenames inside the ZIP
     total_rows: int
     generated_at: str
+
+
+class TrueDataTickExportRequest(BaseModel):
+    """Filter spec for `POST /api/v1/market-data/truedata/ticks/export`.
+
+    Live tick streaming endpoint. Opens a real-time WebSocket to TrueData,
+    subscribes to the requested symbols, captures every trade tick for the
+    requested `duration_seconds`, then disconnects and returns the captured
+    ticks as one legacy `.xls` file per symbol (bundled into a ZIP).
+
+    The .xls files contain the full tick schema (matches the spec the API
+    provider shared with the team):
+
+        symbol_id, timestamp, ltp, ltq, atp, ttq, day_open, day_high,
+        day_low, prev_day_close, oi, prev_day_oi, turnover, special_tag,
+        tick_seq, best_bid_price, best_bid_qty, best_ask_price, best_ask_qty
+
+    IMPORTANT — Real-time only:
+        TrueData has NO historical tick archive. Ticks are captured only for
+        the duration of this request. Calling this endpoint outside market
+        hours (09:15–15:30 IST, Mon–Fri) will return 0 ticks and the request
+        will fail with HTTP 502 ("no ticks received").
+    """
+
+    symbols: list[str] = Field(
+        ...,
+        min_length=1,
+        max_length=50,
+        description=(
+            "List of TrueData contract symbols to subscribe to. Trial accounts "
+            "are capped at 50 concurrent symbol subscriptions.\n\n"
+            "Verified-working symbol formats in the trial:\n"
+            "  • Index futures (continuous): `NIFTY-I`, `BANKNIFTY-I`, `FINNIFTY-I`\n"
+            "  • Index spot:                  `NIFTY 50` (note the space), `SENSEX`\n"
+            "  • NSE Equity:                  `SBIN`, `RELIANCE`, `TCS`, `INFY`\n"
+            "  • Commodity futures:           `CRUDEOIL-I`, `GOLD-I`, `SILVER-I`\n\n"
+            "Option contracts (per team lead's format guidance):\n"
+            "  Symbol Format = SymbolName + Expiry(YYMMDD) + StrikePrice + CE/PE\n"
+            "  Example: NIFTY + 260828 (YYMMDD) + 25000 + CE = `NIFTY26082825000CE`\n"
+            "  Example: BANKNIFTY + 260828 + 58000 + PE      = `BANKNIFTY26082858000PE`\n\n"
+            "Symbols are normalised (strip + uppercase + dedupe) before subscribing."
+        ),
+        examples=[
+            ["NIFTY-I", "BANKNIFTY-I"],
+            ["NIFTY26082825000CE", "NIFTY26082825000PE"],
+            ["SBIN", "RELIANCE", "TCS"],
+        ],
+    )
+    duration_seconds: int = Field(
+        default=60,
+        ge=5,
+        le=300,
+        description=(
+            "How long (seconds) to keep the WebSocket open and capture ticks. "
+            "Capped at 300 (5 min) to avoid HTTP proxy timeouts. Default 60. "
+            "During active market hours, liquid symbols typically produce "
+            "5–50 ticks/sec, so a 60s capture yields 300–3000 rows per symbol."
+        ),
+        examples=[30, 60, 120, 300],
+    )
+    segment: Segment | None = Field(
+        default=None,
+        description=(
+            "Optional segment tag used for metadata/filename grouping only. "
+            "Symbol resolution still happens server-side at TrueData."
+        ),
+    )
+
+    @field_validator("symbols")
+    @classmethod
+    def _normalize_symbols(cls, v: list[str]) -> list[str]:
+        # Strip + uppercase + de-duplicate while preserving order.
+        seen: set[str] = set()
+        cleaned: list[str] = []
+        for s in v:
+            s2 = s.strip().upper()
+            if not s2:
+                continue
+            if s2 in seen:
+                continue
+            seen.add(s2)
+            cleaned.append(s2)
+        if not cleaned:
+            raise ValueError("symbols must contain at least one non-empty value")
+        return cleaned
+
+
+class TrueDataTickExportResponseMeta(BaseModel):
+    """JSON metadata for the tick export ZIP. The primary response is the
+    binary ZIP itself; this schema documents the `X-Export-*` headers."""
+
+    symbols: list[str]
+    duration_seconds: int
+    segment: Segment | None
+    files: list[str]
+    total_rows: int
+    generated_at: str
+    capture_started_at: str
+    capture_ended_at: str

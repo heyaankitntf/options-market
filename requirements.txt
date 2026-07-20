@@ -8,7 +8,8 @@ pydantic-settings>=2.0.0
 python-multipart>=0.0.9  # required by FastAPI for form/file handling
 
 # TrueData market data + Excel export
-truedata-ws>=5.0.0       # official TrueData WebSocket + REST historical SDK
+truedata-ws>=5.0.0       # official TrueData WebSocket + REST historical SDK (historical bars)
+truedata>=7.0.0          # official TrueData unified SDK (live tick streaming via TD_live)
 pandas>=2.0.0            # DataFrame intermediate representation
 xlwt>=1.3.0              # writes legacy .xls (BIFF8) files
 openpyxl>=3.1.0          # fallback reader for any xlsx assets; also pulls in xlrd-free path
