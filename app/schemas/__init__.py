@@ -5,6 +5,8 @@ from app.schemas.market_data import (
     Segment,
     TrueDataExportRequest,
     TrueDataExportResponseMeta,
+    TrueDataTickExportRequest,
+    TrueDataTickExportResponseMeta,
 )
 from app.schemas.otp import DevOtpResponse, OTPRequest, OTPVerifyRequest
 from app.schemas.token import TokenData, TokenResponse
@@ -40,4 +42,6 @@ __all__ = [
     "Segment",
     "TrueDataExportRequest",
     "TrueDataExportResponseMeta",
+    "TrueDataTickExportRequest",
+    "TrueDataTickExportResponseMeta",
 ]

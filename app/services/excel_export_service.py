@@ -202,3 +202,104 @@ def list_files(zip_bytes: bytes) -> list[str]:
     """Read the filenames back out of a ZIP (used for the JSON meta response)."""
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         return zf.namelist()
+
+
+# ---------------------------------------------------------------------------
+# Tick export
+# ---------------------------------------------------------------------------
+
+def _build_tick_metadata_text(
+    symbols: list[str],
+    duration_seconds: int,
+    segment: Segment | None,
+    rows_per_symbol: dict[str, int],
+    truncated: list[str],
+    capture_started_at: str,
+    capture_ended_at: str,
+    total_ticks: int,
+) -> str:
+    """Human-readable `metadata.txt` placed inside the tick ZIP."""
+    lines = [
+        "TrueData Live Tick Export",
+        "=========================",
+        f"Generated at (UTC):    {datetime.now(timezone.utc).isoformat()}",
+        f"Capture started (UTC): {capture_started_at}",
+        f"Capture ended (UTC):   {capture_ended_at}",
+        f"Duration:              {duration_seconds} seconds",
+        f"Segment:               {segment.value if segment else '(not specified)'}",
+        f"Symbols requested:     {len(symbols)}",
+        f"Total ticks captured:  {total_ticks}",
+        "",
+        "Per-symbol tick counts:",
+    ]
+    for sym in symbols:
+        rows = rows_per_symbol.get(sym, 0)
+        flag = "  [TRUNCATED to max rows]" if sym in truncated else ""
+        lines.append(f"  - {sym:<32} {rows:>8} ticks{flag}")
+    lines.extend([
+        "",
+        f"Row cap per symbol: {_MAX_ROWS} "
+        "(BIFF8 .xls has a 65536-row hard limit).",
+        "Columns (in sheet order):",
+        "  symbol_id, timestamp, ltp, ltq, atp, ttq,",
+        "  day_open, day_high, day_low, prev_day_close,",
+        "  oi, prev_day_oi, turnover, special_tag, tick_seq,",
+        "  best_bid_price, best_bid_qty, best_ask_price, best_ask_qty",
+        "",
+        "NOTE: TrueData has NO historical tick archive. These ticks were "
+        "captured live during the request window only.",
+    ])
+    return "\n".join(lines) + "\n"
+
+
+def build_tick_zip(
+    frames: dict[str, pd.DataFrame],
+    *,
+    duration_seconds: int,
+    segment: Segment | None,
+    capture_started_at: str,
+    capture_ended_at: str,
+    total_ticks: int,
+) -> tuple[bytes, dict[str, int], list[str]]:
+    """Bundle per-symbol tick DataFrames into a single ZIP archive.
+
+    Mirrors `build_zip` but with tick-specific metadata. The .xls files use
+    the canonical tick column order (matches the spec the API provider
+    shared with the team).
+    """
+    buf = io.BytesIO()
+    rows_per_symbol: dict[str, int] = {}
+    truncated: list[str] = []
+
+    seg_tag = _sanitize_filename_chunk(segment.value) if segment else "ALL"
+    dur_tag = f"{duration_seconds}s"
+
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for symbol, df in frames.items():
+            sym_tag = _sanitize_filename_chunk(symbol)
+            rows_per_symbol[symbol] = len(df)
+            if len(df) > _MAX_ROWS:
+                truncated.append(symbol)
+                logger.warning(
+                    "Symbol %s has %d ticks; truncating to %d (BIFF8 limit).",
+                    symbol, len(df), _MAX_ROWS,
+                )
+                df = df.iloc[:_MAX_ROWS].copy()
+
+            xls_bytes = _build_xls_bytes(df, sheet_name=symbol)
+            filename = f"{sym_tag}_{seg_tag}_ticks_{dur_tag}.xls"
+            zf.writestr(filename, xls_bytes)
+
+        meta = _build_tick_metadata_text(
+            symbols=list(frames.keys()),
+            duration_seconds=duration_seconds,
+            segment=segment,
+            rows_per_symbol=rows_per_symbol,
+            truncated=truncated,
+            capture_started_at=capture_started_at,
+            capture_ended_at=capture_ended_at,
+            total_ticks=total_ticks,
+        )
+        zf.writestr("metadata.txt", meta)
+
+    return buf.getvalue(), rows_per_symbol, truncated

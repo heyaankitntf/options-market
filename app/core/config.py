@@ -43,6 +43,20 @@ class Settings(BaseSettings):
     # cycle per request.
     TRUEDATA_REQUEST_TIMEOUT_SEC: int = 60
 
+    # --- TrueData live tick streaming ---
+    # Per-request capture duration for the tick-export endpoint. The endpoint
+    # is synchronous (client holds the HTTP connection open while we capture),
+    # so we cap it to avoid nginx/gunicorn timeouts — 5 min is a safe ceiling.
+    TRUEDATA_TICK_MAX_DURATION_SEC: int = 300
+    TRUEDATA_TICK_DEFAULT_DURATION_SEC: int = 60
+    # Trial accounts cap live subscriptions at 50 symbols; we keep our own
+    # cap lower to bound memory + .xls row growth during the capture window.
+    TRUEDATA_TICK_MAX_SYMBOLS: int = 50
+    # How long to wait after subscribing for the first trade tick before
+    # giving up. Outside market hours no trades will arrive, so this governs
+    # the "no data" failure mode.
+    TRUEDATA_TICK_FIRST_TICK_TIMEOUT_SEC: int = 30
+
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
