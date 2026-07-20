@@ -266,7 +266,6 @@ def capture_ticks(
             password=settings.TRUEDATA_PASSWORD,
             url=ws_url,
             live_port=ws_port,
-            historical_api=False,
             log_level=logging.WARNING,
         )
     except Exception as e:
