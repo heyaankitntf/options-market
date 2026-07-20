@@ -57,6 +57,22 @@ class Settings(BaseSettings):
     # the "no data" failure mode.
     TRUEDATA_TICK_FIRST_TICK_TIMEOUT_SEC: int = 30
 
+    # --- TrueData replay feed (off-hours tick replay) ---
+    # TrueData replays the day's market session over a separate WebSocket so
+    # you can exercise your live-tick code path outside market hours. Same
+    # SDK, same callbacks, same schema — only the URL/port differ.
+    #
+    # Availability window (IST): ~18:00 (6 PM) to ~02:00 (2 AM next day).
+    # Outside this window the replay socket rejects connections; we refuse
+    # requests to the /replay endpoint with HTTP 409 to give a clearer error
+    # than the SDK's auth-failure message.
+    #
+    # Source: TrueData KB article + truedata-ws PyPI README.
+    TRUEDATA_REPLAY_URL: str = "replay.truedata.in"
+    TRUEDATA_REPLAY_PORT: int = 8082
+    TRUEDATA_REPLAY_WINDOW_START_HOUR: int = 18   # 6 PM IST inclusive
+    TRUEDATA_REPLAY_WINDOW_END_HOUR: int = 2      # 2 AM IST exclusive (next day)
+
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
