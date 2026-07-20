@@ -43,12 +43,16 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+# IST timezone for replay-window checks. zoneinfo is stdlib (Python 3.9+).
+_IST = ZoneInfo("Asia/Kolkata")
 
 
 class TrueDataError(RuntimeError):
@@ -163,6 +167,8 @@ class TickCaptureResult:
 def capture_ticks(
     symbols: list[str],
     duration_seconds: int,
+    *,
+    replay: bool = False,
 ) -> TickCaptureResult:
     """Open a TrueData WS, subscribe to `symbols`, capture trade ticks for
     `duration_seconds`, disconnect, and return per-symbol DataFrames.
@@ -180,6 +186,12 @@ def capture_ticks(
     duration_seconds : int
         How long to keep the WS open and capture ticks. Caller is responsible
         for clamping to `[5, TRUEDATA_TICK_MAX_DURATION_SEC]`.
+    replay : bool, default False
+        If True, connect to the replay WebSocket (`replay.truedata.in:8082`)
+        instead of the live feed. The replay feed repeats the most recent
+        market session at real-time pace and is only available ~18:00–02:00
+        IST. The caller is responsible for time-window validation; this flag
+        only swaps the URL/port passed to the SDK.
     """
     if not symbols:
         raise TrueDataError("capture_ticks called with empty symbols list")
@@ -193,22 +205,34 @@ def capture_ticks(
             "truedata package is not installed. Run `pip install -r requirements.txt`."
         ) from e
 
+    # Select URL/port based on replay mode. We do NOT time-validate here —
+    # the route layer is responsible for the IST-window check so it can map
+    # the failure to HTTP 409 (Conflict) rather than HTTP 502.
+    if replay:
+        ws_url = settings.TRUEDATA_REPLAY_URL
+        ws_port = settings.TRUEDATA_REPLAY_PORT
+        mode_label = "REPLAY"
+    else:
+        ws_url = settings.TRUEDATA_URL
+        ws_port = settings.TRUEDATA_LIVE_PORT
+        mode_label = "LIVE"
+
     # Per-symbol buffers + a marker that gets set on the first received tick.
     buffers: dict[str, _TickBuffer] = {s: _TickBuffer(s) for s in symbols}
     first_tick_event = threading.Event()
     started_at = datetime.now(timezone.utc)
 
     logger.info(
-        "Starting tick capture: symbols=%s duration=%ds",
-        symbols, duration_seconds,
+        "Starting tick capture [%s]: symbols=%s duration=%ds url=%s port=%s",
+        mode_label, symbols, duration_seconds, ws_url, ws_port,
     )
 
     try:
         td = TD_live(
             login_id=settings.TRUEDATA_USERNAME,
             password=settings.TRUEDATA_PASSWORD,
-            url=settings.TRUEDATA_URL,
-            live_port=settings.TRUEDATA_LIVE_PORT,
+            url=ws_url,
+            live_port=ws_port,
             log_level=logging.WARNING,
         )
     except Exception as e:
@@ -307,3 +331,47 @@ def capture_ticks(
         capture_ended_at=capture_ended_at.isoformat(),
         total_ticks=total,
     )
+
+
+def is_replay_window_open(now: datetime | None = None) -> bool:
+    """Return True if `now` (IST) is inside the TrueData replay availability
+    window.
+
+    The replay feed is available from `TRUEDATA_REPLAY_WINDOW_START_HOUR`
+    (default 18 = 6 PM IST) through `TRUEDATA_REPLAY_WINDOW_END_HOUR`
+    (default 2 = 2 AM IST next day). Because the window crosses midnight,
+    "inside" means: `hour >= start` OR `hour < end`.
+
+    Parameters
+    ----------
+    now : datetime, optional
+        If None, uses the current time. Always interpreted in IST — if the
+        supplied datetime is naive or in another timezone, we convert it.
+    """
+    if now is None:
+        now = datetime.now(_IST)
+    elif now.tzinfo is None:
+        # Treat naive datetimes as IST.
+        now = now.replace(tzinfo=_IST)
+    else:
+        now = now.astimezone(_IST)
+
+    start = settings.TRUEDATA_REPLAY_WINDOW_START_HOUR
+    end = settings.TRUEDATA_REPLAY_WINDOW_END_HOUR
+
+    if start == end:
+        # Degenerate config — treat as always open.
+        return True
+    if start < end:
+        # Same-day window, e.g. 9 → 17.
+        return start <= now.hour < end
+    # Window crosses midnight, e.g. 18 → 2.
+    return now.hour >= start or now.hour < end
+
+
+def replay_window_description() -> str:
+    """Human-readable description of the current replay window, e.g.
+    '18:00–02:00 IST'. Used in HTTP 409 error responses."""
+    start = settings.TRUEDATA_REPLAY_WINDOW_START_HOUR
+    end = settings.TRUEDATA_REPLAY_WINDOW_END_HOUR
+    return f"{start:02d}:00–{end:02d}:00 IST"
