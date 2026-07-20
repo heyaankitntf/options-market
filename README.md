@@ -8,6 +8,10 @@ FastAPI microservice that combines:
 3. **TrueData live tick export** — capture real-time trade ticks (LTP, LTQ,
    ATP, TTQ, O/H/L, OI, Bid/Ask, special tag, tick sequence) for a bounded
    duration and download them as a ZIP of legacy `.xls` files
+4. **TrueData replay tick export** — same pipeline as #3 but connects to
+   TrueData's off-hours replay feed (`replay.truedata.in:8082`) so you can
+   exercise the tick-consuming code path between 18:00–02:00 IST without
+   waiting for live market hours
 
 ---
 
@@ -287,6 +291,60 @@ cat headers.txt            # inspect X-Export-* headers
 unzip -l truedata_ticks.zip
 ```
 
+### Replay feed (off-hours tick replay)
+
+TrueData replays the day's market session over a **separate WebSocket** so
+you can exercise your tick-consuming code path outside market hours. The
+replay feed uses the same SDK, same callbacks, and the same 19-column tick
+schema as the live endpoint — only the WebSocket URL differs
+(`replay.truedata.in:8082` instead of `push.truedata.in:<live_port>`).
+
+**Availability window:** ~18:00–02:00 IST daily (i.e. starting ~2.5 hours
+after market close and ending before the next session's pre-open). Outside
+this window the replay socket rejects connections; the endpoint returns
+HTTP 409 (Conflict) with a descriptive message rather than letting the SDK
+hang.
+
+**Tick pacing:** replayed ticks are delivered at real-time pace (not
+sped-up). The `timestamp` column carries the *original* market timestamp
+(e.g. a replay tick arriving at 19:00 IST will have a `timestamp` near
+09:30 IST from the morning session).
+
+```bash
+# Capture 60 seconds of REPLAYED ticks for NIFTY-I and BANKNIFTY-I.
+# Only works between 18:00 and 02:00 IST — otherwise 409.
+curl -s -X POST http://localhost:8000/api/v1/market-data/truedata/ticks/replay/export \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "symbols":          ["NIFTY-I", "BANKNIFTY-I"],
+        "duration_seconds": 60,
+        "segment":          "NSE F&O"
+      }' \
+  -D headers.txt \
+  -o truedata_replay_ticks.zip
+
+cat headers.txt            # X-Export-Mode: replay
+unzip -l truedata_replay_ticks.zip
+```
+
+#### Replay endpoint — additional headers
+
+| Header                    | Value                                                |
+|---------------------------|------------------------------------------------------|
+| `X-Export-Mode`           | `replay` (always; lets you distinguish from live)    |
+
+All other headers (`X-Export-Files`, `X-Export-Total-Rows`, `X-Export-Capture-Started`, `X-Export-Capture-Ended`, `X-Export-Generated-At`, `X-Export-Truncated`) match the live tick export.
+
+#### Replay endpoint — error codes
+
+| Status | Cause                                                                                       |
+|--------|---------------------------------------------------------------------------------------------|
+| 401    | Missing/invalid Bearer JWT                                                                  |
+| 422    | Schema validation failed (empty symbols, duration out of `[5, 300]`, …)                     |
+| 409    | Outside the replay availability window (call the live endpoint during market hours instead) |
+| 502    | Replay socket itself unreachable, or 0 ticks captured (rare; usually a config issue)        |
+
 ### Future work (Level 2 market depth)
 
 This endpoint captures the **L1 trade tick** (best bid/ask only). If your
@@ -315,6 +373,10 @@ pattern.
 | `TRUEDATA_TICK_DEFAULT_DURATION_SEC`  | `60`                             | Default capture window for tick export   |
 | `TRUEDATA_TICK_MAX_SYMBOLS`           | `50`                             | Max symbols per tick-export request      |
 | `TRUEDATA_TICK_FIRST_TICK_TIMEOUT_SEC`| `30`                             | Wait-for-first-tick timeout (info only)  |
+| `TRUEDATA_REPLAY_URL`                 | `replay.truedata.in`             | Replay websocket host (off-hours dev)    |
+| `TRUEDATA_REPLAY_PORT`                | `8082`                           | Replay websocket port                    |
+| `TRUEDATA_REPLAY_WINDOW_START_HOUR`   | `18`                             | Replay availability window start (IST, 24h) |
+| `TRUEDATA_REPLAY_WINDOW_END_HOUR`     | `2`                              | Replay availability window end (IST, 24h; crosses midnight) |
 
 Override any of them via a `.env` file or real env vars in production.
 

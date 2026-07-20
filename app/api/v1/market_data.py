@@ -227,3 +227,117 @@ def export_truedata_ticks_xls(
             "X-Export-Capture-Ended": result.capture_ended_at,
         },
     )
+
+
+@router.post(
+    "/truedata/ticks/replay/export",
+    summary="Capture replayed TrueData trade ticks (off-hours) and return them as a ZIP of .xls files",
+    status_code=status.HTTP_200_OK,
+)
+def export_truedata_replay_ticks_xls(
+    payload: TrueDataTickExportRequest,
+    current_user: User = Depends(get_current_user),
+    _db: Session = Depends(get_db),
+) -> Response:
+    """Connect to TrueData's **replay** WebSocket, subscribe to the requested
+    symbols, capture every replayed trade tick for `duration_seconds`, then
+    return the captured ticks as a ZIP of legacy `.xls` files (one per symbol).
+
+    The replay feed repeats the most recent market session at real-time pace
+    and is only available outside market hours (~18:00–02:00 IST). It uses
+    the exact same SDK, callbacks, and tick schema as the live endpoint —
+    only the WebSocket URL (`replay.truedata.in:8082` instead of
+    `push.truedata.in:<live_port>`) differs.
+
+    Use this endpoint to exercise your tick-consuming code path during
+    evenings/weekends without waiting for live market hours. The .xls files
+    contain the same 19-column tick schema as the live tick export.
+
+    Availability:
+        Replay socket is open ~18:00–02:00 IST daily. Calling this endpoint
+        outside that window returns HTTP 409 with a descriptive message.
+
+    Requires a valid Bearer JWT (same auth as `/users/me`).
+    """
+    # Refuse before we even touch the SDK if we're outside the replay window.
+    # The SDK would either hang on connect or raise an opaque auth error;
+    # HTTP 409 (Conflict) is clearer for the caller.
+    if not truedata_tick_service.is_replay_window_open():
+        window = truedata_tick_service.replay_window_description()
+        logger.info("Replay export rejected — outside window (%s)", window)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"TrueData replay feed is only available between {window}. "
+                "Call the live tick export endpoint during market hours "
+                "(09:15–15:30 IST, Mon–Fri) instead."
+            ),
+        )
+
+    # Clamp duration to the configured max (defence-in-depth).
+    duration = min(
+        max(payload.duration_seconds, 5),
+        settings.TRUEDATA_TICK_MAX_DURATION_SEC,
+    )
+
+    logger.info(
+        "TrueData REPLAY tick export requested by user_id=%s phone=%s — symbols=%s duration=%ds segment=%s",
+        current_user.id,
+        current_user.phone,
+        payload.symbols,
+        duration,
+        payload.segment.value if payload.segment else None,
+    )
+
+    # 1. Capture replayed ticks (hard-fail on any error or 0-tick result).
+    try:
+        result = truedata_tick_service.capture_ticks(
+            symbols=payload.symbols,
+            duration_seconds=duration,
+            replay=True,
+        )
+    except truedata_tick_service.TrueDataError as e:
+        logger.error("TrueData replay tick export failed: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"TrueData error: {e}",
+        ) from e
+
+    # 2. Bundle into a ZIP of .xls files (reuses the live tick bundler —
+    # the per-symbol .xls format is identical).
+    zip_bytes, rows_per_symbol, truncated = excel_export_service.build_tick_zip(
+        result.frames,
+        duration_seconds=duration,
+        segment=payload.segment,
+        capture_started_at=result.capture_started_at,
+        capture_ended_at=result.capture_ended_at,
+        total_ticks=result.total_ticks,
+    )
+
+    files = excel_export_service.list_files(zip_bytes)
+    generated_at = datetime.now(timezone.utc).isoformat()
+
+    safe_user = str(current_user.id).replace("-", "")[:8]
+    zip_name = f"truedata_replay_ticks_{safe_user}_{duration}s.zip"
+
+    logger.info(
+        "TrueData REPLAY tick export ready: %d files, %d total ticks, truncated=%s",
+        len(files),
+        result.total_ticks,
+        truncated,
+    )
+
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{zip_name}"',
+            "X-Export-Files": ",".join(files),
+            "X-Export-Generated-At": generated_at,
+            "X-Export-Total-Rows": str(result.total_ticks),
+            "X-Export-Truncated": ",".join(truncated) if truncated else "",
+            "X-Export-Capture-Started": result.capture_started_at,
+            "X-Export-Capture-Ended": result.capture_ended_at,
+            "X-Export-Mode": "replay",
+        },
+    )
