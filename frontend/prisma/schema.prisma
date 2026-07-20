@@ -1,0 +1,249 @@
+// OptFlow — Options Market Data Automation Platform
+// Prisma schema (SQLite)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Users & RBAC
+// ---------------------------------------------------------------------------
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String
+  password  String
+  role      String   @default("viewer") // admin | operator | viewer
+  active    Boolean  @default(true)
+  lastLogin DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Automation Profiles
+// ---------------------------------------------------------------------------
+
+model Profile {
+  id              String   @id @default(cuid())
+  name            String
+  symbol          String   // NIFTY | BANKNIFTY | SENSEX | FINNIFTY ...
+  exchange        String   @default("NFO")
+  expiryKind      String   @default("weekly") // weekly | monthly
+  expiryDate      String?  // explicit YYYY-MM-DD override
+  intervalMin     Int      @default(10) // refresh interval in minutes
+  templateId      String?
+  outputFormats   String   @default("json,csv") // csv,json,xlsx,pdf
+  enabled         Boolean  @default(true)
+  paused          Boolean  @default(false)
+  allStrikes      Boolean  @default(true)
+  notifyChannels  String   @default("") // comma separated channel ids
+  lastRunAt       DateTime?
+  nextRunAt       DateTime?
+  lastStatus      String?  // success | failed | running
+  runCount        Int      @default(0)
+  failCount       Int      @default(0)
+  successCount    Int      @default(0)
+  avgDurationMs   Int      @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  template        FormulaTemplate? @relation(fields: [templateId], references: [id], onDelete: SetNull)
+  executions      Execution[]
+  reports         Report[]
+  rawSnapshots    RawSnapshot[]
+
+  @@index([enabled, paused, nextRunAt])
+  @@index([symbol])
+}
+
+// ---------------------------------------------------------------------------
+// Raw option-chain snapshots captured from the portal
+// ---------------------------------------------------------------------------
+
+model RawSnapshot {
+  id           String   @id @default(cuid())
+  profileId    String
+  symbol       String
+  expiry       String
+  spotPrice    Float
+  fetchedAt    DateTime @default(now())
+  rowsJson     String   // JSON array of option chain rows
+  sourceIp     String?
+  portalSession String?
+  status       String   @default("captured") // captured | failed
+  durationMs   Int      @default(0)
+  profile      Profile  @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@index([profileId, fetchedAt])
+  @@index([symbol])
+}
+
+// ---------------------------------------------------------------------------
+// Processed reports
+// ---------------------------------------------------------------------------
+
+model Report {
+  id              String   @id @default(cuid())
+  profileId       String
+  snapshotId      String?
+  symbol          String
+  expiry          String
+  spotPrice       Float
+  generatedAt     DateTime @default(now())
+  pcr             Float    // put-call ratio (OI)
+  pcrVolume       Float    // put-call ratio (volume)
+  maxPain         Float
+  ivPut           Float    // avg ATM IV put
+  ivCall          Float    // avg ATM IV call
+  atmStrike       Float
+  totalCallOi     Float
+  totalPutOi      Float
+  totalCallVol    Float
+  totalPutVol     Float
+  callChgOi       Float
+  putChgOi        Float
+  trend           String   // bullish | bearish | neutral
+  trendScore      Int      // -100..100
+  support         Float
+  resistance      Float
+  indicatorsJson  String   // JSON: strikes table + extra metrics
+  summaryJson     String   // JSON: AI/Rule summary text blocks
+  reportHash      String
+  profile         Profile  @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@index([profileId, generatedAt])
+  @@index([symbol, generatedAt])
+  @@index([generatedAt])
+}
+
+// ---------------------------------------------------------------------------
+// Executions (one per profile run)
+// ---------------------------------------------------------------------------
+
+model Execution {
+  id           String   @id @default(cuid())
+  profileId    String
+  status       String   // running | success | failed | cancelled
+  stage        String   // login | navigate | select | export | process | notify
+  startedAt    DateTime @default(now())
+  finishedAt   DateTime?
+  durationMs   Int      @default(0)
+  message      String?
+  error        String?
+  snapshotId   String?
+  reportId     String?
+  triggeredBy  String   @default("scheduler") // scheduler | manual | rerun
+  retries      Int      @default(0)
+  profile      Profile  @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  logs         Log[]
+
+  @@index([profileId, startedAt])
+  @@index([status])
+}
+
+model Log {
+  id          String   @id @default(cuid())
+  executionId String?
+  profileId   String?
+  level       String   // info | warn | error | debug | browser
+  source      String   @default("system") // system | browser | engine | scheduler | notify
+  message     String
+  meta        String?  // JSON
+  createdAt   DateTime @default(now())
+  execution   Execution? @relation(fields: [executionId], references: [id], onDelete: Cascade)
+
+  @@index([createdAt])
+  @@index([level])
+  @@index([profileId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Formula templates (configurable calculations)
+// ---------------------------------------------------------------------------
+
+model FormulaTemplate {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  description String?
+  version     Int      @default(1)
+  configJson  String   // JSON: thresholds, weights, included metrics
+  enabled     Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  profiles    Profile[]
+}
+
+// ---------------------------------------------------------------------------
+// Credentials (encrypted at rest)
+// ---------------------------------------------------------------------------
+
+model Credential {
+  id        String   @id @default(cuid())
+  label     String   @unique
+  portal    String   @default("icharts")
+  username  String
+  cipher    String   // encrypted password blob
+  iv        String   // initialization vector
+  tag       String?  // auth tag (aes-256-gcm)
+  active    Boolean  @default(true)
+  lastUsed  DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+
+model NotificationChannel {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  type      String   // telegram | email | whatsapp | webhook
+  config    String   // JSON: token, chatId, smtp, url ...
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  logs      NotificationLog[]
+}
+
+model NotificationLog {
+  id          String   @id @default(cuid())
+  channelId   String
+  reportId    String?
+  profileId   String?
+  status      String   // sent | failed | queued
+  message     String?
+  error       String?
+  createdAt   DateTime @default(now())
+  channel     NotificationChannel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@index([createdAt])
+  @@index([channelId])
+}
+
+// ---------------------------------------------------------------------------
+// System settings + health metrics
+// ---------------------------------------------------------------------------
+
+model SystemSetting {
+  id    String @id
+  value String
+  updatedAt DateTime @updatedAt
+}
+
+model HealthMetric {
+  id        String   @id @default(cuid())
+  metric    String   // cpu | mem | queue | latency | ...
+  value     Float
+  unit      String?
+  createdAt DateTime @default(now())
+
+  @@index([metric, createdAt])
+}

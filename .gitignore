@@ -10,8 +10,8 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+/lib/
+/lib64/
 parts/
 sdist/
 var/
@@ -52,9 +52,6 @@ data/*.sqlite3
 htmlcov/
 .tox/
 
-# Node (frontend if in same repo)
-# node_modules/
-# npm-debug.log*
 
 # Logs
 *.log
@@ -70,3 +67,16 @@ Thumbs.db
 
 # Ruff (linter cache)
 .ruff_cache/
+
+# Frontend
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.turbo/
+frontend/.vercel/
+frontend/.env*
+frontend/.eslintcache
+frontend/coverage/
+frontend/*.tsbuildinfo
+frontend/.cache/
+frontend/npm-debug.log*
