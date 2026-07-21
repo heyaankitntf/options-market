@@ -80,3 +80,6 @@ frontend/coverage/
 frontend/*.tsbuildinfo
 frontend/.cache/
 frontend/npm-debug.log*
+# Standalone TrueData app exports (auto-saved .xlsx files)
+option_chain_exports/
+tick_data_exports/
