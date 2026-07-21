@@ -83,6 +83,7 @@ class TrueDataError(RuntimeError):
 # Underlying, Expiry, Strike, Type
 OPTION_CHAIN_COLUMNS: list[str] = [
     "Symbol ID",
+    "Symbol",
     "Date Time",
     "LTP",
     "LTQ",
@@ -211,6 +212,7 @@ def _enrich_row_from_live_data(
     if live_entry is not None:
         # Full tick-level data available from live_data.
         row["Symbol ID"] = int(_safe_attr(live_entry, "symbol_id", 0) or 0)
+        row["Symbol"] = str(_safe_attr(live_entry, "symbol", symbol_name) or symbol_name)
         row["Date Time"] = _safe_attr(live_entry, "timestamp", snapshot_time)
         row["LTP"] = float(_safe_attr(live_entry, "ltp", chain_ltp) or chain_ltp or 0.0)
         row["LTQ"] = int(_safe_attr(live_entry, "ltq", chain_ltq) or chain_ltq or 0)
@@ -233,6 +235,7 @@ def _enrich_row_from_live_data(
         # Fallback: use only what the chain DataFrame provides.
         # Missing fields are set to None.
         row["Symbol ID"] = None
+        row["Symbol"] = symbol_name
         row["Date Time"] = snapshot_time
         row["LTP"] = _to_native_or_none(chain_ltp)
         row["LTQ"] = _to_native_or_none(chain_ltq)
