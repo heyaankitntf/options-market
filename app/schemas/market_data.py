@@ -249,10 +249,13 @@ class OptionChainSpec(BaseModel):
         description=(
             "Underlying index or stock symbol — bare name, no expiry/strike "
             "suffix. Examples: `NIFTY`, `BANKNIFTY`, `FINNIFTY`, `SENSEX`, "
-            "`MIDCPNIFTY`. Underlying is normalised (strip + uppercase) "
-            "before being forwarded to the TrueData SDK."
+            "`MIDCPNIFTY`, `RELIANCE`. Underlying is normalised (strip + "
+            "uppercase) before being forwarded to the TrueData SDK.\n\n"
+            "Note: For stock options like RELIANCE, the endpoint automatically "
+            "falls back to TrueData's REST API if the WebSocket live feed "
+            "doesn't stream those symbols."
         ),
-        examples=["NIFTY", "BANKNIFTY"],
+        examples=["NIFTY", "BANKNIFTY", "RELIANCE"],
     )
     expiry: date = Field(
         ...,
@@ -322,11 +325,17 @@ class TrueDataOptionChainExportRequest(BaseModel):
     Call (CE) and Put (PE) data are written to SEPARATE .xls files:
     each (underlying, expiry) pair produces `*_CE.xls` and `*_PE.xls`.
 
-    IMPORTANT — Account entitlement:
-        Trial accounts get 'User Subscription Expired' on the option-chain
-        subscription request. The endpoint will work the moment the
-        account is upgraded to a plan with NSE F&O option-chain support
-        — no code changes required.
+    IMPORTANT — Account entitlement & dual-mode:
+        This endpoint uses a dual-mode approach:
+          1. First tries the WebSocket live feed via `TD_live.start_option_chain()`
+             (works reliably for NIFTY option chains).
+          2. If WebSocket fails or captures no data, automatically falls back
+             to TrueData's REST API (`getOptionChain` endpoint) which supports
+             stock options like RELIANCE as well.
+
+        Trial accounts: the WebSocket live feed may not stream stock option
+        ticks, but the REST API fallback works during market hours.
+        No code changes required — the fallback is automatic.
     """
 
     chains: list[OptionChainSpec] = Field(
