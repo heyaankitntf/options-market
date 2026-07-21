@@ -188,35 +188,22 @@ def _enrich_row_from_live_data(
     enriched tick-level fields from `td.live_data`.
 
     The chain DataFrame only contains a subset of fields. The `live_data`
-    dict keyed by symbol_id contains the full `TickLiveData` with all the
-    fields the user wants (atp, day_open, day_high, day_low, prev_day_close,
-    turnover, special_tag, tick_seq, etc.).
+    dict keyed by symbol NAME contains the full `tick_feed` dataclass with
+    all the fields the user wants (symbol_id, atp, day_open, day_high,
+    day_low, prev_day_close, turnover, special_tag, tick_seq, etc.).
 
-    We look up each option symbol in `td.live_data` via the
-    `symbol_mkt_id_map` (which maps symbol names → symbol IDs → live_data
-    entries). If not found, we fall back to the chain DataFrame values
-    for the fields that exist there, and use None for the rest.
+    IMPORTANT: The v7 SDK (TD_live) stores live_data and touchline_data
+    keyed by the **symbol name string** (e.g. "NIFTY26072124000CE"), NOT
+    by req_id or symbol_id. We look up the symbol directly.
     """
-    # Try to find the symbol in live_data.
+    # Try to find the symbol in live_data — keyed by symbol NAME string.
     live_entry = None
     if hasattr(td, 'live_data') and td.live_data:
-        # The SDK maintains a symbol_mkt_id_map: symbol_name -> set of req_ids
-        # and live_data: req_id -> TickLiveData
-        symbol_map = getattr(td, 'symbol_mkt_id_map', {})
-        req_ids = symbol_map.get(symbol_name, set())
-        for rid in req_ids:
-            if rid in td.live_data:
-                live_entry = td.live_data[rid]
-                break
+        live_entry = td.live_data.get(symbol_name)
 
-    # Also try direct lookup in touchline_data (initial snapshot).
+    # Fallback to touchline_data (initial snapshot) — also keyed by name.
     if live_entry is None and hasattr(td, 'touchline_data') and td.touchline_data:
-        symbol_map = getattr(td, 'symbol_mkt_id_map', {})
-        req_ids = symbol_map.get(symbol_name, set())
-        for rid in req_ids:
-            if rid in td.touchline_data:
-                live_entry = td.touchline_data[rid]
-                break
+        live_entry = td.touchline_data.get(symbol_name)
 
     # Build the row with user's requested column order.
     row: dict[str, Any] = {}
@@ -284,37 +271,24 @@ def _enrich_row_from_live_data(
 
 
 def _get_greek_data(td: Any, symbol_name: str) -> dict[str, Any] | None:
-    """Try to look up greek data for a symbol from td.greek_data."""
+    """Try to look up greek data for a symbol from td.greek_data.
+
+    The SDK stores greek_data keyed by symbol name string (same as
+    live_data / touchline_data).
+    """
     if not hasattr(td, 'greek_data') or not td.greek_data:
         return None
-    greek_data = td.greek_data
-    # greek_data is typically keyed by symbol_id or symbol name
-    # Try symbol name first, then by looking up symbol_id from live_data
-    if symbol_name in greek_data:
-        gd = greek_data[symbol_name]
-        return {
-            "iv": _safe_attr(gd, "iv"),
-            "delta": _safe_attr(gd, "delta"),
-            "theta": _safe_attr(gd, "theta"),
-            "gamma": _safe_attr(gd, "gamma"),
-            "vega": _safe_attr(gd, "vega"),
-            "rho": _safe_attr(gd, "rho"),
-        }
-    # Try via symbol_id
-    symbol_map = getattr(td, 'symbol_mkt_id_map', {})
-    req_ids = symbol_map.get(symbol_name, set())
-    for rid in req_ids:
-        if rid in greek_data:
-            gd = greek_data[rid]
-            return {
-                "iv": _safe_attr(gd, "iv"),
-                "delta": _safe_attr(gd, "delta"),
-                "theta": _safe_attr(gd, "theta"),
-                "gamma": _safe_attr(gd, "gamma"),
-                "vega": _safe_attr(gd, "vega"),
-                "rho": _safe_attr(gd, "rho"),
-            }
-    return None
+    gd = td.greek_data.get(symbol_name)
+    if gd is None:
+        return None
+    return {
+        "iv": _safe_attr(gd, "iv"),
+        "delta": _safe_attr(gd, "delta"),
+        "theta": _safe_attr(gd, "theta"),
+        "gamma": _safe_attr(gd, "gamma"),
+        "vega": _safe_attr(gd, "vega"),
+        "rho": _safe_attr(gd, "rho"),
+    }
 
 
 # --- Capture orchestrator ----------------------------------------------
