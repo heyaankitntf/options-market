@@ -66,6 +66,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, time as dt_time
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -74,11 +75,16 @@ from app.core.config import settings
 from app.services.truedata_connection_manager import (
     td_manager,
     TrueDataConnectionError,
+    _make_sdk_exit_raiser,
+    _patch_sdk_exit,
 )
 
 # TrueData REST API URLs — used by the REST fallback mode.
 REST_API_ATM_URL = "https://api.truedata.in/getATMStrike"
 REST_API_CHAIN_URL = "https://api.truedata.in/getOptionChain"
+
+# IST timezone for replay-window checks. zoneinfo is stdlib (Python 3.9+).
+_IST = ZoneInfo("Asia/Kolkata")
 
 logger = logging.getLogger(__name__)
 
@@ -887,3 +893,340 @@ def capture_option_chains(
         capture_ended_at=capture_ended_at.isoformat(),
         total_rows=total,
     )
+
+
+# --- Replay helpers -----------------------------------------------------
+
+def is_replay_window_open(now: datetime | None = None) -> bool:
+    """Return True if `now` (IST) is inside the TrueData replay availability
+    window.
+
+    The replay feed is available from `TRUEDATA_REPLAY_WINDOW_START_HOUR`
+    (default 18 = 6 PM IST) through `TRUEDATA_REPLAY_WINDOW_END_HOUR`
+    (default 2 = 2 AM IST next day). Because the window crosses midnight,
+    "inside" means: `hour >= start` OR `hour < end`.
+
+    Parameters
+    ----------
+    now : datetime, optional
+        If None, uses the current time. Always interpreted in IST — if the
+        supplied datetime is naive or in another timezone, we convert it.
+    """
+    if now is None:
+        now = datetime.now(_IST)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=_IST)
+    else:
+        now = now.astimezone(_IST)
+
+    start = settings.TRUEDATA_REPLAY_WINDOW_START_HOUR
+    end = settings.TRUEDATA_REPLAY_WINDOW_END_HOUR
+
+    if start == end:
+        return True  # Degenerate config — treat as always open.
+    if start < end:
+        return start <= now.hour < end
+    # Window crosses midnight, e.g. 18 → 2.
+    return now.hour >= start or now.hour < end
+
+
+def replay_window_description() -> str:
+    """Human-readable description of the current replay window, e.g.
+    '18:00–02:00 IST'. Used in HTTP 409 error responses."""
+    start = settings.TRUEDATA_REPLAY_WINDOW_START_HOUR
+    end = settings.TRUEDATA_REPLAY_WINDOW_END_HOUR
+    return f"{start:02d}:00–{end:02d}:00 IST"
+
+
+def capture_option_chains_replay(
+    requests: list[ChainRequest],
+    *,
+    duration_seconds: int,
+    snapshot_interval_seconds: int,
+) -> ChainCaptureResult:
+    """Capture option-chain data via TrueData's replay WebSocket.
+
+    Connects to the replay server (replay.truedata.in:8082) instead of the
+    live push server. The replay feed repeats the most recent market session
+    at real-time pace and is only available ~18:00–02:00 IST.
+
+    This creates a **separate** `TD_live` instance (not the shared singleton)
+    because the replay server uses a different URL/port. The replay connection
+    is ephemeral — created for this request and torn down afterwards.
+
+    If the replay WebSocket approach captures no data, automatically falls
+    back to TrueData's REST API (`getOptionChain` endpoint).
+
+    NO AUTHENTICATION REQUIRED — this is a public endpoint.
+
+    Hard-fails (raises TrueDataError) if:
+      - The replay connection cannot be established.
+      - 0 rows are captured via both WebSocket replay AND REST fallback.
+    """
+    if not requests:
+        raise TrueDataError("capture_option_chains_replay called with empty requests list")
+
+    started_at = datetime.now(timezone.utc)
+    logger.info(
+        "Starting option-chain REPLAY capture: %d chains, duration=%ds, snapshot_interval=%ds",
+        len(requests), duration_seconds, snapshot_interval_seconds,
+    )
+
+    # 1. Create a dedicated TD_live instance connected to the replay server.
+    td = None
+    try:
+        from truedata.websocket.TD_live import TD_live  # type: ignore
+    except ImportError as e:
+        raise TrueDataError(
+            "truedata (v7+) package is not installed. "
+            "Run `pip install -r requirements.txt`."
+        ) from e
+
+    # Patch SDK exit before instantiation (same as connection manager).
+    sdk_exit_raiser = _make_sdk_exit_raiser()
+    _patch_sdk_exit(TD_live, sdk_exit_raiser)
+
+    try:
+        logger.info(
+            "Connecting to TrueData REPLAY WS: user=%s url=%s port=%s",
+            settings.TRUEDATA_USERNAME,
+            settings.TRUEDATA_REPLAY_URL,
+            settings.TRUEDATA_REPLAY_PORT,
+        )
+        td = TD_live(
+            login_id=settings.TRUEDATA_USERNAME,
+            password=settings.TRUEDATA_PASSWORD,
+            url=settings.TRUEDATA_REPLAY_URL,
+            live_port=settings.TRUEDATA_REPLAY_PORT,
+            log_level=logging.WARNING,
+        )
+    except Exception as e:
+        msg = str(e)
+        if "User Already Connected" in msg or "already connected" in msg.lower():
+            logger.warning(
+                "Replay WebSocket already in use — falling back to REST API"
+            )
+            return capture_option_chains_via_rest(requests)
+        logger.warning(
+            "Replay TD_live connection failed: %s — falling back to REST API", e
+        )
+        return capture_option_chains_via_rest(requests)
+
+    # 2. Start option chains on the replay connection.
+    chains: list[tuple[ChainRequest, Any, str]] = []
+    failed_ws_requests: list[ChainRequest] = []
+
+    for req in requests:
+        try:
+            expiry_dt = datetime.combine(req.expiry, dt_time(15, 30))
+            chain = td.start_option_chain(
+                symbol=req.underlying,
+                expiry=expiry_dt,
+                chain_length=req.chain_length,
+                bid_ask=req.bid_ask,
+                greek=req.greek,
+            )
+            expiry_str = req.expiry.strftime("%Y-%m-%d")
+            chains.append((req, chain, expiry_str))
+            logger.info(
+                "Started chain via REPLAY WebSocket: underlying=%s expiry=%s length=%d",
+                req.underlying, expiry_str, req.chain_length,
+            )
+        except SystemExit:
+            logger.warning(
+                "SDK exit() for %s/%s on replay — will retry via REST API",
+                req.underlying, req.expiry,
+            )
+            failed_ws_requests.append(req)
+        except Exception as e:
+            logger.warning(
+                "Replay start_option_chain failed for %s/%s: %s — "
+                "will retry via REST API",
+                req.underlying, req.expiry, e,
+            )
+            failed_ws_requests.append(req)
+
+    # Wait for data to populate.
+    time.sleep(3)
+
+    # If all chains failed on replay WebSocket, go straight to REST.
+    if not chains and failed_ws_requests:
+        logger.info(
+            "All %d chains failed on replay WebSocket — using REST API fallback",
+            len(failed_ws_requests),
+        )
+        _safe_disconnect(td)
+        return capture_option_chains_via_rest(failed_ws_requests)
+
+    # 3. Sample snapshots from the replay WebSocket.
+    snapshot_rows: dict[str, list[dict[str, Any]]] = {}
+    any_greek = any(req.greek for req in requests)
+    columns = OPTION_CHAIN_COLUMNS + (GREEK_COLUMNS if any_greek else [])
+
+    for req, _, expiry_str in chains:
+        base_key = f"{req.underlying}_{expiry_str}"
+        snapshot_rows[f"{base_key}_CE"] = []
+        snapshot_rows[f"{base_key}_PE"] = []
+
+    snapshot_count = 0
+    try:
+        deadline = time.monotonic() + duration_seconds
+
+        while time.monotonic() < deadline:
+            snapshot_time = datetime.now(timezone.utc)
+            for req, chain, expiry_str in chains:
+                try:
+                    chain_df = chain.get_option_chain()
+                except Exception as e:
+                    logger.warning(
+                        "Replay get_option_chain failed for %s/%s: %s",
+                        req.underlying, expiry_str, e,
+                    )
+                    continue
+                if chain_df is None or chain_df.empty:
+                    continue
+
+                df = chain_df.reset_index() if "symbols" not in chain_df.columns else chain_df
+                if "symbols" in df.columns:
+                    df = df.rename(columns={"symbols": "symbol"})
+
+                for _, row_data in df.iterrows():
+                    symbol_name = str(row_data.get("symbol", ""))
+
+                    greek_data = None
+                    if any_greek:
+                        greek_data = _get_greek_data(td, symbol_name)
+
+                    enriched = _enrich_row_from_live_data(
+                        td=td,
+                        symbol_name=symbol_name,
+                        snapshot_time=snapshot_time,
+                        underlying=req.underlying,
+                        expiry_str=expiry_str,
+                        strike=row_data.get("strike"),
+                        option_type=str(row_data.get("type", "")),
+                        chain_ltp=row_data.get("ltp"),
+                        chain_oi=row_data.get("oi"),
+                        chain_prev_oi=row_data.get("prev_oi"),
+                        chain_bid=row_data.get("bid"),
+                        chain_bid_qty=row_data.get("bid_qty"),
+                        chain_ask=row_data.get("ask"),
+                        chain_ask_qty=row_data.get("ask_qty"),
+                        chain_ltq=row_data.get("ltq"),
+                        chain_volume=row_data.get("volume"),
+                        greek_data=greek_data,
+                    )
+                    opt_type = str(row_data.get("type", "")).upper()
+                    suffix = "CE" if opt_type == "CE" else "PE"
+                    key = f"{req.underlying}_{expiry_str}_{suffix}"
+                    snapshot_rows[key].append(enriched)
+
+            snapshot_count += 1
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(snapshot_interval_seconds, remaining))
+
+    except Exception as e:
+        logger.warning(
+            "Error during replay capture: %s: %s — will try REST fallback",
+            type(e).__name__, e,
+        )
+        failed_ws_requests.extend(req for req, _, _ in chains)
+        chains = []
+    finally:
+        # Stop all chains on the replay connection.
+        for req, chain, _ in chains:
+            try:
+                chain.stop_option_chain()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "Replay stop_option_chain failed for %s: %s", req.underlying, e
+                )
+        # Disconnect the replay connection — it's ephemeral, not shared.
+        _safe_disconnect(td)
+
+    # Build DataFrames from replay WebSocket data.
+    frames: dict[str, pd.DataFrame] = {}
+    total = 0
+    for key, rows in snapshot_rows.items():
+        total += len(rows)
+        if not rows:
+            frames[key] = pd.DataFrame(columns=columns)
+            continue
+        df = pd.DataFrame(rows, columns=columns)
+        df = df.sort_values(
+            ["Date Time", "Strike", "Type"], kind="stable"
+        ).reset_index(drop=True)
+        frames[key] = df
+
+    # If replay captured nothing, try REST fallback.
+    needs_rest = failed_ws_requests.copy()
+    if total == 0:
+        needs_rest = requests
+
+    if needs_rest:
+        logger.info(
+            "Attempting REST API fallback for %d replay chains...",
+            len(needs_rest),
+        )
+        try:
+            rest_result = capture_option_chains_via_rest(needs_rest)
+            for key, rest_df in rest_result.frames.items():
+                if key in frames and not frames[key].empty:
+                    frames[key] = pd.concat(
+                        [frames[key], rest_df], ignore_index=True
+                    ).sort_values(
+                        ["Date Time", "Strike", "Type"], kind="stable"
+                    ).reset_index(drop=True)
+                else:
+                    frames[key] = rest_df
+            total = sum(len(f) for f in frames.values())
+            logger.info(
+                "REST API fallback succeeded for replay: combined total=%d rows",
+                total,
+            )
+        except TrueDataError as rest_err:
+            if total == 0:
+                raise TrueDataError(
+                    "No option-chain rows were captured via replay WebSocket or "
+                    f"REST API. Replay WebSocket: 0 rows. REST fallback also "
+                    f"failed: {rest_err}"
+                ) from rest_err
+            logger.warning(
+                "REST fallback failed for some replay chains, but replay "
+                "WebSocket captured %d rows. Continuing with replay data only. "
+                "REST error: %s",
+                total, rest_err,
+            )
+
+    if total == 0:
+        raise TrueDataError(
+            "No option-chain rows were captured during the replay capture "
+            "window. Common causes: (a) replay feed is not active (check "
+            "18:00–02:00 IST), (b) account not entitled for option-chain data, "
+            "(c) requested expiry is not a valid trading expiry for the underlying."
+        )
+
+    capture_ended_at = datetime.now(timezone.utc)
+    logger.info(
+        "Option-chain REPLAY capture complete: %d total rows across %d frames",
+        total, len(frames),
+    )
+
+    return ChainCaptureResult(
+        frames=frames,
+        capture_started_at=started_at.isoformat(),
+        capture_ended_at=capture_ended_at.isoformat(),
+        total_rows=total,
+    )
+
+
+def _safe_disconnect(td: Any) -> None:
+    """Safely disconnect a TD_live instance, swallowing errors."""
+    if td is None:
+        return
+    try:
+        td.disconnect()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Replay disconnect failed: %s: %s", type(e).__name__, e)

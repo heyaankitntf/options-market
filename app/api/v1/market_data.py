@@ -516,3 +516,160 @@ def export_truedata_option_chain_xls(
             "X-Export-Mode": "option-chain",
         },
     )
+
+
+@router.post(
+    "/truedata/option-chain/replay/export",
+    summary="Capture replayed TrueData option-chain snapshots and return them as a ZIP of .xls files",
+    status_code=status.HTTP_200_OK,
+)
+def export_truedata_option_chain_replay_xls(
+    payload: TrueDataOptionChainExportRequest,
+) -> Response:
+    """Connect to TrueData's **replay** WebSocket, start one option chain per
+    entry in `chains`, sample snapshots at `snapshot_interval_seconds`
+    cadence for `duration_seconds`, then return the captured rows as a ZIP
+    of legacy `.xls` files (one per (underlying, expiry) pair).
+
+    The replay feed repeats the most recent market session at real-time pace
+    and is only available outside market hours (~18:00–02:00 IST). It uses
+    the same SDK and option-chain schema as the live endpoint — only the
+    WebSocket URL (`replay.truedata.in:8082`) differs.
+
+    Use this endpoint to exercise your option-chain code path during
+    evenings/weekends without waiting for live market hours.
+
+    The output format is identical to the live option-chain export:
+    separate CE/PE .xls files with all 24 columns (Symbol ID, Symbol,
+    Date Time, LTP, LTQ, ATP, TTQ, Open, High, Low, Prev Close, OI,
+    Prev Open Int Close, Day's Turnover, Special Tag, Tick Sequence No,
+    Bid, Bid Qty, Ask, Ask Qty, Underlying, Expiry, Strike, Type) plus
+    optional greek columns.
+
+    If the replay WebSocket doesn't capture data, automatically falls back
+    to TrueData's REST API (`getOptionChain` endpoint).
+
+    Availability:
+        Replay socket is open ~18:00–02:00 IST daily. Calling this endpoint
+        outside that window returns HTTP 409 with a descriptive message.
+
+    NO AUTHENTICATION REQUIRED — this endpoint is public (no JWT).
+    """
+    # Refuse before we even touch the SDK if we're outside the replay window.
+    if not truedata_option_chain_service.is_replay_window_open():
+        window = truedata_option_chain_service.replay_window_description()
+        logger.info("Option-chain replay export rejected — outside window (%s)", window)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"TrueData replay feed is only available between {window}. "
+                "Call the live option-chain export endpoint during market hours "
+                "(09:15–15:30 IST, Mon–Fri) instead."
+            ),
+        )
+
+    # Clamp duration and snapshot interval.
+    duration = min(
+        max(payload.duration_seconds, 5),
+        settings.TRUEDATA_CHAIN_MAX_DURATION_SEC,
+    )
+    snapshot_interval = min(
+        max(payload.snapshot_interval_seconds, settings.TRUEDATA_CHAIN_MIN_SNAPSHOT_INTERVAL_SEC),
+        settings.TRUEDATA_CHAIN_MAX_SNAPSHOT_INTERVAL_SEC,
+    )
+
+    # Reject if too many chains.
+    if len(payload.chains) > settings.TRUEDATA_CHAIN_MAX_PAIRS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"Too many chains: {len(payload.chains)} > "
+                f"TRUEDATA_CHAIN_MAX_PAIRS ({settings.TRUEDATA_CHAIN_MAX_PAIRS}). "
+                "Reduce the number of (underlying, expiry) pairs or raise the "
+                "setting in production."
+            ),
+        )
+
+    logger.info(
+        "TrueData option-chain REPLAY export requested (no auth) — "
+        "chains=%d duration=%ds snapshot_interval=%ds segment=%s",
+        len(payload.chains),
+        duration,
+        snapshot_interval,
+        payload.segment.value if payload.segment else None,
+    )
+
+    # Build ChainRequest dataclasses for the service layer.
+    chain_requests = [
+        truedata_option_chain_service.ChainRequest(
+            underlying=spec.underlying,
+            expiry=spec.expiry,
+            chain_length=spec.chain_length,
+            bid_ask=spec.bid_ask,
+            greek=spec.greek,
+        )
+        for spec in payload.chains
+    ]
+
+    # 1. Capture option-chain snapshots via replay WebSocket.
+    try:
+        result = truedata_option_chain_service.capture_option_chains_replay(
+            chain_requests,
+            duration_seconds=duration,
+            snapshot_interval_seconds=snapshot_interval,
+        )
+    except truedata_option_chain_service.TrueDataError as e:
+        logger.error("TrueData option-chain replay export failed: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"TrueData error: {e}",
+        ) from e
+
+    # 2. Bundle into a ZIP of .xls files.
+    chains_meta = [
+        {
+            "underlying": spec.underlying,
+            "expiry": spec.expiry.isoformat(),
+            "chain_length": spec.chain_length,
+            "bid_ask": spec.bid_ask,
+            "greek": spec.greek,
+        }
+        for spec in payload.chains
+    ]
+    zip_bytes, rows_per_chain, truncated = excel_export_service.build_option_chain_zip(
+        result.frames,
+        chains=chains_meta,
+        duration_seconds=duration,
+        snapshot_interval_seconds=snapshot_interval,
+        segment=payload.segment,
+        capture_started_at=result.capture_started_at,
+        capture_ended_at=result.capture_ended_at,
+        total_rows=result.total_rows,
+    )
+
+    files = excel_export_service.list_files(zip_bytes)
+    generated_at = datetime.now(timezone.utc).isoformat()
+
+    zip_name = f"truedata_option_chain_replay_{duration}s.zip"
+
+    logger.info(
+        "TrueData option-chain REPLAY export ready: %d files, %d total rows, truncated=%s",
+        len(files),
+        result.total_rows,
+        truncated,
+    )
+
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{zip_name}"',
+            "X-Export-Files": ",".join(files),
+            "X-Export-Generated-At": generated_at,
+            "X-Export-Total-Rows": str(result.total_rows),
+            "X-Export-Truncated": ",".join(truncated) if truncated else "",
+            "X-Export-Capture-Started": result.capture_started_at,
+            "X-Export-Capture-Ended": result.capture_ended_at,
+            "X-Export-Mode": "option-chain-replay",
+        },
+    )
