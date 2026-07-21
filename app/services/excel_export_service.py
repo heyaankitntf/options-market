@@ -303,3 +303,127 @@ def build_tick_zip(
         zf.writestr("metadata.txt", meta)
 
     return buf.getvalue(), rows_per_symbol, truncated
+
+
+# ---------------------------------------------------------------------------
+# Option-chain export
+# ---------------------------------------------------------------------------
+
+def _build_option_chain_metadata_text(
+    chains: list[dict[str, object]],
+    duration_seconds: int,
+    snapshot_interval_seconds: int,
+    segment: Segment | None,
+    rows_per_chain: dict[str, int],
+    truncated: list[str],
+    capture_started_at: str,
+    capture_ended_at: str,
+    total_rows: int,
+) -> str:
+    """Human-readable `metadata.txt` placed inside the option-chain ZIP."""
+    lines = [
+        "TrueData Option-Chain Export",
+        "============================",
+        f"Generated at (UTC):        {datetime.now(timezone.utc).isoformat()}",
+        f"Capture started (UTC):     {capture_started_at}",
+        f"Capture ended (UTC):       {capture_ended_at}",
+        f"Duration:                  {duration_seconds} seconds",
+        f"Snapshot interval:         {snapshot_interval_seconds} seconds",
+        f"Approx snapshots/chain:    {max(1, duration_seconds // snapshot_interval_seconds)}",
+        f"Segment:                   {segment.value if segment else '(not specified)'}",
+        f"Chains requested:          {len(chains)}",
+        f"Total rows captured:       {total_rows}",
+        "",
+        "Per-chain row counts:",
+    ]
+    for ch in chains:
+        key = f"{ch['underlying']}_{ch['expiry']}"
+        rows = rows_per_chain.get(key, 0)
+        flag = "  [TRUNCATED to max rows]" if key in truncated else ""
+        greek_tag = " greek=on" if ch.get("greek") else ""
+        bidask_tag = " bidask=off" if not ch.get("bid_ask", True) else ""
+        lines.append(
+            f"  - {ch['underlying']:<12} {ch['expiry']}  len={ch['chain_length']:<3}"
+            f"  {rows:>8} rows{greek_tag}{bidask_tag}{flag}"
+        )
+    lines.extend([
+        "",
+        f"Row cap per chain: {_MAX_ROWS} "
+        "(BIFF8 .xls has a 65536-row hard limit).",
+        "Columns (in sheet order):",
+        "  snapshot_time, underlying, expiry, symbol, strike, type,",
+        "  ltp, ltt, ltq, volume, price_change, price_change_perc,",
+        "  oi, prev_oi, oi_change, oi_change_perc,",
+        "  bid, bid_qty, ask, ask_qty",
+        "  [+ iv, delta, theta, gamma, vega, rho]  (only when greek=true)",
+        "",
+        "NOTE: Each row is one strike x option-type x snapshot-time. The SDK "
+        "updates the chain in real-time; we snapshot its current state at "
+        "the configured cadence.",
+        "",
+        "TRIAL ACCOUNT CAVEAT: TrueData trial accounts get 'User Subscription "
+        "Expired' on option-chain subscriptions. Upgrade the plan to use this "
+        "endpoint; no code changes required.",
+    ])
+    return "\n".join(lines) + "\n"
+
+
+def build_option_chain_zip(
+    frames: dict[str, pd.DataFrame],
+    *,
+    chains: list[dict[str, object]],
+    duration_seconds: int,
+    snapshot_interval_seconds: int,
+    segment: Segment | None,
+    capture_started_at: str,
+    capture_ended_at: str,
+    total_rows: int,
+) -> tuple[bytes, dict[str, int], list[str]]:
+    """Bundle per-(underlying, expiry) option-chain DataFrames into a ZIP.
+
+    Mirrors `build_tick_zip` but with option-chain-specific metadata. The
+    .xls files use the canonical option-chain column order (matches the
+    spec the API provider shared with the team — see
+    `OPTION_CHAIN_COLUMNS` in `truedata_option_chain_service.py`).
+    """
+    buf = io.BytesIO()
+    rows_per_chain: dict[str, int] = {}
+    truncated: list[str] = []
+
+    seg_tag = _sanitize_filename_chunk(segment.value) if segment else "ALL"
+    dur_tag = f"{duration_seconds}s"
+    snap_tag = f"snap{snapshot_interval_seconds}s"
+
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for key, df in frames.items():
+            # key format is "{UNDERLYING}_{YYYY-MM-DD}" — already sanitised
+            # (uppercase letters, digits, underscore) but pass through the
+            # sanitizer anyway for defence-in-depth.
+            key_tag = _sanitize_filename_chunk(key)
+            rows_per_chain[key] = len(df)
+            if len(df) > _MAX_ROWS:
+                truncated.append(key)
+                logger.warning(
+                    "Chain %s has %d rows; truncating to %d (BIFF8 limit).",
+                    key, len(df), _MAX_ROWS,
+                )
+                df = df.iloc[:_MAX_ROWS].copy()
+
+            xls_bytes = _build_xls_bytes(df, sheet_name=key)
+            filename = f"{key_tag}_{seg_tag}_chain_{dur_tag}_{snap_tag}.xls"
+            zf.writestr(filename, xls_bytes)
+
+        meta = _build_option_chain_metadata_text(
+            chains=chains,
+            duration_seconds=duration_seconds,
+            snapshot_interval_seconds=snapshot_interval_seconds,
+            segment=segment,
+            rows_per_chain=rows_per_chain,
+            truncated=truncated,
+            capture_started_at=capture_started_at,
+            capture_ended_at=capture_ended_at,
+            total_rows=total_rows,
+        )
+        zf.writestr("metadata.txt", meta)
+
+    return buf.getvalue(), rows_per_chain, truncated
