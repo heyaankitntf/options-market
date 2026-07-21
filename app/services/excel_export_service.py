@@ -49,8 +49,15 @@ def _to_native(value):
     except (TypeError, ValueError):
         pass  # pd.isna raises on list-like; ignore
     if isinstance(value, pd.Timestamp):
-        return value.to_pydatetime()
+        dt = value.to_pydatetime()
+        # xlwt can't handle offset-aware datetimes — strip tzinfo.
+        if dt.tzinfo is not None:
+            dt = dt.replace(tzinfo=None)
+        return dt
     if isinstance(value, _dt.datetime):
+        # xlwt can't handle offset-aware datetimes — strip tzinfo.
+        if value.tzinfo is not None:
+            return value.replace(tzinfo=None)
         return value
     if isinstance(value, _dt.date):
         return _dt.datetime(value.year, value.month, value.day)
@@ -351,11 +358,13 @@ def _build_option_chain_metadata_text(
         f"Row cap per chain: {_MAX_ROWS} "
         "(BIFF8 .xls has a 65536-row hard limit).",
         "Columns (in sheet order):",
-        "  snapshot_time, underlying, expiry, symbol, strike, type,",
-        "  ltp, ltt, ltq, volume, price_change, price_change_perc,",
-        "  oi, prev_oi, oi_change, oi_change_perc,",
-        "  bid, bid_qty, ask, ask_qty",
-        "  [+ iv, delta, theta, gamma, vega, rho]  (only when greek=true)",
+        "  Symbol ID, Date Time, LTP, LTQ, ATP, TTQ,",
+        "  Open, High, Low, Prev Close,",
+        "  OI, Prev Open Int Close, Day's Turnover,",
+        "  Special Tag, Tick Sequence No,",
+        "  Bid, Bid Qty, Ask, Ask Qty,",
+        "  Underlying, Expiry, Strike, Type",
+        "  [+ IV, Delta, Theta, Gamma, Vega, Rho]  (only when greek=true)",
         "",
         "NOTE: Each row is one strike x option-type x snapshot-time. The SDK "
         "updates the chain in real-time; we snapshot its current state at "

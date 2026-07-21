@@ -369,11 +369,18 @@ def export_truedata_option_chain_xls(
     of legacy `.xls` files (one per (underlying, expiry) pair).
 
     Each `.xls` row is one strike x option-type x snapshot-time, with
-    20 base columns (snapshot_time, underlying, expiry, symbol, strike,
-    type, ltp, ltt, ltq, volume, price_change, price_change_perc, oi,
-    prev_oi, oi_change, oi_change_perc, bid, bid_qty, ask, ask_qty) plus
-    6 optional greek columns (iv, delta, theta, gamma, vega, rho) when
-    any chain requests `greek=true`.
+    23 base columns enriched from both the option-chain DataFrame and the
+    full tick-level `live_data` dict:
+
+        Symbol ID, Date Time, LTP, LTQ, ATP, TTQ,
+        Open, High, Low, Prev Close,
+        OI, Prev Open Int Close, Day's Turnover,
+        Special Tag, Tick Sequence No,
+        Bid, Bid Qty, Ask, Ask Qty,
+        Underlying, Expiry, Strike, Type
+
+    Plus 6 optional greek columns (IV, Delta, Theta, Gamma, Vega, Rho)
+    when any chain requests `greek=true`.
 
     The endpoint is designed for the team lead's "current expiry + next
     expiry" use case — pass two `OptionChainSpec` entries with the same

@@ -5,70 +5,43 @@ option-chain snapshots for one or more (underlying, expiry) pairs over a
 bounded duration. Used by the
 `/api/v1/market-data/truedata/option-chain/export` endpoint.
 
-Why v7 (`truedata.TD_live`) and not v5 (`truedata_ws.TD`)?
-----------------------------------------------------------
-The option-chain feature is only available in v7's `TD_live` class via the
-`start_option_chain()` method. v5 (`truedata_ws.TD`) has a separate
-`TD_chain.py` module that calls `exit()` on any error (kills the process)
-and doesn't support greeks — unusable for a long-running web service.
-
-How it works
+Architecture
 ------------
-1. Open a `TD_live` websocket connection to `push.truedata.in:<live_port>`.
-2. For each requested (underlying, expiry) pair, call
-   `td.start_option_chain(symbol, expiry, chain_length, bid_ask, greek)`
-   which returns an `OptionChain` object that auto-updates in a daemon
-   thread by reading the shared `td.live_data` dict.
-3. Sleep for `snapshot_interval_seconds`, then call `chain.get_option_chain()`
-   to grab a point-in-time copy of the dataframe for each chain. Repeat
-   until `duration_seconds` elapses.
-4. Stop all chains, disconnect, project every snapshot onto a flat row
-   schema, and return per-(underlying, expiry) DataFrames.
+This service now uses the shared `TDConnectionManager` singleton instead of
+creating a new `TD_live` per request. TrueData's server enforces a strict
+one-connection-per-user policy — opening a second connection while the
+standalone app already holds one causes the "User Already Connected" error
+that was blocking the team.
 
-Hard-fail contract
--------------------
-Any SDK error (connect failure, subscription rejection, missing data) is
-re-raised as `TrueDataError`. The HTTP route maps that to HTTP 502. If
-0 rows are captured across ALL chains (typically the trial-account
-"User Subscription Expired" error, or market closed with no option
-trades), we also raise `TrueDataError` so the caller gets a clear 502
-instead of an empty ZIP.
+By sharing a single process-wide `TD_live` instance, we avoid this entirely.
 
-CRITICAL: The v7 SDK's `TD_live.start_option_chain()` calls the builtin
-`exit()` whenever `get_atm()` or `OptionChain()` raises — which would
-kill the entire FastAPI worker process. We patch `exit` in the SDK
-module's namespace at the start of `capture_option_chains` so it raises
-`_SdkExitRaisedError` instead, which we catch and re-raise as
-`TrueDataError`. This keeps the worker alive across SDK errors.
+Data enrichment
+---------------
+The SDK's `OptionChain.update_chain()` method only copies a subset of fields
+from `live_data` into its DataFrame (ltp, ltq, volume, oi, bid/ask, etc.).
+However, `live_data[symbol_id]` contains the FULL tick-level dataclass
+(`TickLiveData`) with many more fields: symbol_id, atp, day_open,
+day_high, day_low, prev_day_close, turnover, special_tag, tick_seq, etc.
 
-Note: `TD_live.__init__` already calls `self.connect()` at the end of
-its constructor — we do NOT call `td.connect()` again. Connection
-errors are caught by wrapping the constructor in try/except.
+After calling `chain.get_option_chain()` to get the base DataFrame, we
+enrich each row by looking up the corresponding entry in `td.live_data`
+and pulling the additional fields the user requested.
 
-Trial-account caveat
---------------------
-The trial account we ship as default (`Trial126` / `sand126`) does NOT
-include option-chain entitlement. Calling `start_option_chain` will raise
-`TrueDataError` with the message `"User Subscription Expired"` from the
-SDK's WS layer. The endpoint will work the moment the account is upgraded
-to a plan with option-chain support — no code changes required. This is
-documented prominently in the README and in the error message.
-
-Output schema (20 base columns + 6 optional greek columns)
------------------------------------------------------------
+Output schema
+-------------
 Each row in the output .xls is one strike × option-type × snapshot-time:
 
-    snapshot_time, underlying, expiry,
-    symbol, strike, type,
-    ltp, ltt, ltq, volume, price_change, price_change_perc,
-    oi, prev_oi, oi_change, oi_change_perc,
-    bid, bid_qty, ask, ask_qty,
-    [iv, delta, theta, gamma, vega, rho]   # only when greek=true
+    Symbol ID, Date Time, LTP, LTQ, ATP, TTQ,
+    Open, High, Low, Prev Close,
+    OI, Prev Open Int Close, Day's Turnover,
+    Special Tag, Tick Sequence No,
+    Bid, Bid Qty, Ask, Ask Qty,
+    Underlying, Expiry, Strike, Type
 
-The first 3 columns identify the snapshot + chain; the next 3 identify
-the contract within the chain; the remaining columns mirror the SDK's
-`chain_columns` + `chain_greek_fields` constants exactly (see
-`truedata/websocket/constants.py`).
+This matches the spec the user requested exactly. The last 4 columns
+(Underlying, Expiry, Strike, Type) are appended after the tick-level fields
+for easy identification while keeping the first 19 columns in the same
+order as the tick export.
 """
 
 from __future__ import annotations
@@ -82,6 +55,10 @@ from typing import Any
 import pandas as pd
 
 from app.core.config import settings
+from app.services.truedata_connection_manager import (
+    td_manager,
+    TrueDataConnectionError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -91,115 +68,53 @@ class TrueDataError(RuntimeError):
     at least one option-chain row. Mapped to HTTP 502 by the route layer."""
 
 
-class _SdkExitRaisedError(RuntimeError):
-    """Raised by our patched `exit` to prevent the truedata SDK from killing
-    the FastAPI worker process. Not part of the public API."""
-
-    def __init__(self, original_message: str = "") -> None:
-        # Strip "exit(") wrapper noise if any leaked through; the SDK calls
-        # `exit()` (no args) so the message is usually empty.
-        self.original_message = original_message or (
-            "TrueData SDK called exit() — typically 'User Subscription "
-            "Expired' (trial account lacks option-chain entitlement) or "
-            "an invalid symbol/expiry."
-        )
-        super().__init__(self.original_message)
-
-
-def _make_sdk_exit_raiser():
-    """Return a callable that replaces the builtin `exit` in the SDK module
-    namespace. Calling it raises `_SdkExitRaisedError` instead of killing the
-    process."""
-    def _exit_raiser(code=None):
-        msg = ""
-        if isinstance(code, str):
-            msg = code
-        elif code is not None and not isinstance(code, int):
-            msg = str(code)
-        raise _SdkExitRaisedError(msg)
-    return _exit_raiser
-
-
-def _patch_sdk_exit(td_live_cls, exit_raiser) -> None:
-    """Patch `exit` in the module that defines `TD_live` so SDK calls to
-    `exit()` raise instead of killing the process. Idempotent — safe to call
-    multiple times.
-
-    The SDK's `start_option_chain` uses the builtin `exit` looked up at
-    call time from its module globals, so patching the module namespace is
-    sufficient. We do NOT need to patch `builtins.exit` (which would affect
-    the whole interpreter).
-    """
-    import sys as _sys
-    # The TD_live class is defined in truedata.websocket.TD_live
-    module = _sys.modules.get(td_live_cls.__module__)
-    if module is not None:
-        if getattr(module, "_otp_exit_patched", False):
-            return
-        module.exit = exit_raiser  # type: ignore[attr-defined]
-        # Also patch `quit` for completeness — some SDK versions use it.
-        module.quit = exit_raiser  # type: ignore[attr-defined]
-        module._otp_exit_patched = True  # type: ignore[attr-defined]
-        logger.debug("Patched exit/quit in %s", td_live_cls.__module__)
-
-
-def _format_subscription_error(original_msg: str) -> str:
-    """Format a friendly 'trial account not entitled' error message."""
-    return (
-        "TrueData reports the account is not entitled for option-chain "
-        f"data ({original_msg}). This is the typical behaviour for trial "
-        "accounts — the trial plan does NOT include NSE F&O option chain. "
-        "Upgrade the TrueData plan to one that includes option-chain "
-        "entitlement; no code changes are required after the upgrade."
-    )
-
-
 # --- Output schema -------------------------------------------------------
-
-# Base columns — always present in the output .xls. Matches the SDK's
-# `chain_columns` constant (see truedata/websocket/constants.py) prepended
-# with three identification columns (snapshot_time, underlying, expiry) and
-# with the SDK's internal `symbols` index promoted to a regular column
-# named `symbol` for easier downstream consumption.
+# Matches the user's requested column order exactly:
+# Symbol ID, Date Time (Timestamp), LTP, LTQ, ATP, TTQ,
+# Open, High, Low, Prev Close,
+# OI, Prev Open Int Close, Day's Turnover,
+# Special Tag, Tick Sequence No,
+# Bid, Bid Qty, Ask, Ask Qty
+#
+# Plus identification columns appended at the end:
+# Underlying, Expiry, Strike, Type
 OPTION_CHAIN_COLUMNS: list[str] = [
-    "snapshot_time",
-    "underlying",
-    "expiry",
-    "symbol",
-    "strike",
-    "type",
-    "ltp",
-    "ltt",
-    "ltq",
-    "volume",
-    "price_change",
-    "price_change_perc",
-    "oi",
-    "prev_oi",
-    "oi_change",
-    "oi_change_perc",
-    "bid",
-    "bid_qty",
-    "ask",
-    "ask_qty",
+    "Symbol ID",
+    "Date Time",
+    "LTP",
+    "LTQ",
+    "ATP",
+    "TTQ",
+    "Open",
+    "High",
+    "Low",
+    "Prev Close",
+    "OI",
+    "Prev Open Int Close",
+    "Day's Turnover",
+    "Special Tag",
+    "Tick Sequence No",
+    "Bid",
+    "Bid Qty",
+    "Ask",
+    "Ask Qty",
+    "Underlying",
+    "Expiry",
+    "Strike",
+    "Type",
 ]
 
-# Greek columns — appended after OPTION_CHAIN_COLUMNS when the caller
-# requests `greek=true`. Order matches `chain_greek_fields` in the SDK.
-GREEK_COLUMNS: list[str] = ["iv", "delta", "theta", "gamma", "vega", "rho"]
+# Greek columns — appended when greek=true is requested on any chain.
+GREEK_COLUMNS: list[str] = ["IV", "Delta", "Theta", "Gamma", "Vega", "Rho"]
 
 
 # --- Request / result dataclasses ---------------------------------------
 
 @dataclass
 class ChainRequest:
-    """A single (underlying, expiry) pair to subscribe to.
-
-    `underlying` is normalised to uppercase by the schema layer before
-    reaching here. `expiry` is a `date` (not `datetime`).
-    """
+    """A single (underlying, expiry) pair to subscribe to."""
     underlying: str
-    expiry: Any  # datetime.date — typed as Any to avoid import cycle
+    expiry: Any  # datetime.date
     chain_length: int
     bid_ask: bool
     greek: bool
@@ -219,64 +134,7 @@ class ChainCaptureResult:
     total_rows: int
 
 
-# --- Row projection -----------------------------------------------------
-
-def _row_from_chain_df(
-    chain_df: pd.DataFrame,
-    *,
-    underlying: str,
-    expiry_str: str,
-    snapshot_time: datetime,
-    include_greek: bool,
-) -> list[dict[str, Any]]:
-    """Project the SDK's chain dataframe onto our flat row schema.
-
-    The SDK's dataframe is indexed by symbol (e.g. `NIFTY26082825000CE`)
-    with `strike` and `type` as regular columns plus the data columns
-    from `chain_columns` (and optionally `chain_greek_fields`). We
-    flatten it to one dict per row, prepending our identification columns.
-
-    We coerce numeric types to plain Python natives because xlwt can't
-    serialise numpy scalars. Missing values become `None` (which xlwt
-    skips) so a partially-populated snapshot still writes cleanly.
-    """
-    if chain_df is None or chain_df.empty:
-        return []
-
-    # Determine which columns to read. The SDK always includes the base
-    # chain_columns; greek_columns only when greek=true was requested.
-    base_cols = [
-        "strike", "type",
-        "ltp", "ltt", "ltq", "volume",
-        "price_change", "price_change_perc",
-        "oi", "prev_oi", "oi_change", "oi_change_perc",
-        "bid", "bid_qty", "ask", "ask_qty",
-    ]
-    greek_cols = GREEK_COLUMNS if include_greek else []
-
-    # The SDK dataframe has the symbol as its index. Reset so we can read
-    # it as a column.
-    df = chain_df.reset_index() if "symbols" not in chain_df.columns else chain_df
-    # The SDK names the index 'symbols' (see TD_chain.init_dataframe); rename
-    # to our preferred 'symbol' for clarity.
-    if "symbols" in df.columns:
-        df = df.rename(columns={"symbols": "symbol"})
-
-    rows: list[dict[str, Any]] = []
-    snap_iso = snapshot_time.isoformat()
-    for _, row in df.iterrows():
-        out: dict[str, Any] = {
-            "snapshot_time": snap_iso,
-            "underlying": underlying,
-            "expiry": expiry_str,
-            "symbol": str(row.get("symbol", "")),
-        }
-        for col in base_cols + greek_cols:
-            val = row.get(col)
-            out[col] = _to_native_or_none(val)
-        rows.append(out)
-    return rows
-
+# --- Row projection (enriched from live_data) ----------------------------
 
 def _to_native_or_none(val: Any) -> Any:
     """Coerce a numpy/pandas scalar to a plain Python native, returning
@@ -296,6 +154,164 @@ def _to_native_or_none(val: Any) -> Any:
     return val
 
 
+def _safe_attr(obj: Any, name: str, default: Any = None) -> Any:
+    """Get attribute from an object, returning default if missing or None."""
+    val = getattr(obj, name, default)
+    return val if val is not None else default
+
+
+def _enrich_row_from_live_data(
+    td: Any,
+    symbol_name: str,
+    snapshot_time: datetime,
+    underlying: str,
+    expiry_str: str,
+    strike: Any,
+    option_type: str,
+    chain_ltp: Any,
+    chain_oi: Any,
+    chain_prev_oi: Any,
+    chain_bid: Any,
+    chain_bid_qty: Any,
+    chain_ask: Any,
+    chain_ask_qty: Any,
+    chain_ltq: Any,
+    chain_volume: Any,
+    greek_data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a complete row by combining chain DataFrame data with the
+    enriched tick-level fields from `td.live_data`.
+
+    The chain DataFrame only contains a subset of fields. The `live_data`
+    dict keyed by symbol_id contains the full `TickLiveData` with all the
+    fields the user wants (atp, day_open, day_high, day_low, prev_day_close,
+    turnover, special_tag, tick_seq, etc.).
+
+    We look up each option symbol in `td.live_data` via the
+    `symbol_mkt_id_map` (which maps symbol names → symbol IDs → live_data
+    entries). If not found, we fall back to the chain DataFrame values
+    for the fields that exist there, and use None for the rest.
+    """
+    # Try to find the symbol in live_data.
+    live_entry = None
+    if hasattr(td, 'live_data') and td.live_data:
+        # The SDK maintains a symbol_mkt_id_map: symbol_name -> set of req_ids
+        # and live_data: req_id -> TickLiveData
+        symbol_map = getattr(td, 'symbol_mkt_id_map', {})
+        req_ids = symbol_map.get(symbol_name, set())
+        for rid in req_ids:
+            if rid in td.live_data:
+                live_entry = td.live_data[rid]
+                break
+
+    # Also try direct lookup in touchline_data (initial snapshot).
+    if live_entry is None and hasattr(td, 'touchline_data') and td.touchline_data:
+        symbol_map = getattr(td, 'symbol_mkt_id_map', {})
+        req_ids = symbol_map.get(symbol_name, set())
+        for rid in req_ids:
+            if rid in td.touchline_data:
+                live_entry = td.touchline_data[rid]
+                break
+
+    # Build the row with user's requested column order.
+    row: dict[str, Any] = {}
+
+    if live_entry is not None:
+        # Full tick-level data available from live_data.
+        row["Symbol ID"] = int(_safe_attr(live_entry, "symbol_id", 0) or 0)
+        row["Date Time"] = _safe_attr(live_entry, "timestamp", snapshot_time)
+        row["LTP"] = float(_safe_attr(live_entry, "ltp", chain_ltp) or chain_ltp or 0.0)
+        row["LTQ"] = int(_safe_attr(live_entry, "ltq", chain_ltq) or chain_ltq or 0)
+        row["ATP"] = float(_safe_attr(live_entry, "atp", 0.0) or 0.0)
+        row["TTQ"] = float(_safe_attr(live_entry, "ttq", chain_volume) or chain_volume or 0.0)
+        row["Open"] = float(_safe_attr(live_entry, "day_open", 0.0) or 0.0)
+        row["High"] = float(_safe_attr(live_entry, "day_high", 0.0) or 0.0)
+        row["Low"] = float(_safe_attr(live_entry, "day_low", 0.0) or 0.0)
+        row["Prev Close"] = float(_safe_attr(live_entry, "prev_day_close", 0.0) or 0.0)
+        row["OI"] = int(_safe_attr(live_entry, "oi", chain_oi) or chain_oi or 0)
+        row["Prev Open Int Close"] = int(_safe_attr(live_entry, "prev_day_oi", chain_prev_oi) or chain_prev_oi or 0)
+        row["Day's Turnover"] = float(_safe_attr(live_entry, "turnover", 0.0) or 0.0)
+        row["Special Tag"] = str(_safe_attr(live_entry, "special_tag", "") or "")
+        row["Tick Sequence No"] = int(_safe_attr(live_entry, "tick_seq", 0) or 0)
+        row["Bid"] = float(_safe_attr(live_entry, "best_bid_price", chain_bid) or chain_bid or 0.0)
+        row["Bid Qty"] = int(_safe_attr(live_entry, "best_bid_qty", chain_bid_qty) or chain_bid_qty or 0)
+        row["Ask"] = float(_safe_attr(live_entry, "best_ask_price", chain_ask) or chain_ask or 0.0)
+        row["Ask Qty"] = int(_safe_attr(live_entry, "best_ask_qty", chain_ask_qty) or chain_ask_qty or 0)
+    else:
+        # Fallback: use only what the chain DataFrame provides.
+        # Missing fields are set to None.
+        row["Symbol ID"] = None
+        row["Date Time"] = snapshot_time
+        row["LTP"] = _to_native_or_none(chain_ltp)
+        row["LTQ"] = _to_native_or_none(chain_ltq)
+        row["ATP"] = None
+        row["TTQ"] = _to_native_or_none(chain_volume)
+        row["Open"] = None
+        row["High"] = None
+        row["Low"] = None
+        row["Prev Close"] = None
+        row["OI"] = _to_native_or_none(chain_oi)
+        row["Prev Open Int Close"] = _to_native_or_none(chain_prev_oi)
+        row["Day's Turnover"] = None
+        row["Special Tag"] = ""
+        row["Tick Sequence No"] = None
+        row["Bid"] = _to_native_or_none(chain_bid)
+        row["Bid Qty"] = _to_native_or_none(chain_bid_qty)
+        row["Ask"] = _to_native_or_none(chain_ask)
+        row["Ask Qty"] = _to_native_or_none(chain_ask_qty)
+
+    # Identification columns (always present).
+    row["Underlying"] = underlying
+    row["Expiry"] = expiry_str
+    row["Strike"] = _to_native_or_none(strike)
+    row["Type"] = str(option_type) if option_type else ""
+
+    # Greek columns (if requested).
+    if greek_data is not None:
+        row["IV"] = greek_data.get("iv")
+        row["Delta"] = greek_data.get("delta")
+        row["Theta"] = greek_data.get("theta")
+        row["Gamma"] = greek_data.get("gamma")
+        row["Vega"] = greek_data.get("vega")
+        row["Rho"] = greek_data.get("rho")
+
+    return row
+
+
+def _get_greek_data(td: Any, symbol_name: str) -> dict[str, Any] | None:
+    """Try to look up greek data for a symbol from td.greek_data."""
+    if not hasattr(td, 'greek_data') or not td.greek_data:
+        return None
+    greek_data = td.greek_data
+    # greek_data is typically keyed by symbol_id or symbol name
+    # Try symbol name first, then by looking up symbol_id from live_data
+    if symbol_name in greek_data:
+        gd = greek_data[symbol_name]
+        return {
+            "iv": _safe_attr(gd, "iv"),
+            "delta": _safe_attr(gd, "delta"),
+            "theta": _safe_attr(gd, "theta"),
+            "gamma": _safe_attr(gd, "gamma"),
+            "vega": _safe_attr(gd, "vega"),
+            "rho": _safe_attr(gd, "rho"),
+        }
+    # Try via symbol_id
+    symbol_map = getattr(td, 'symbol_mkt_id_map', {})
+    req_ids = symbol_map.get(symbol_name, set())
+    for rid in req_ids:
+        if rid in greek_data:
+            gd = greek_data[rid]
+            return {
+                "iv": _safe_attr(gd, "iv"),
+                "delta": _safe_attr(gd, "delta"),
+                "theta": _safe_attr(gd, "theta"),
+                "gamma": _safe_attr(gd, "gamma"),
+                "vega": _safe_attr(gd, "vega"),
+                "rho": _safe_attr(gd, "rho"),
+            }
+    return None
+
+
 # --- Capture orchestrator ----------------------------------------------
 
 def capture_option_chains(
@@ -304,100 +320,35 @@ def capture_option_chains(
     duration_seconds: int,
     snapshot_interval_seconds: int,
 ) -> ChainCaptureResult:
-    """Open a TrueData WS, start each requested option chain, sample
-    snapshots at `snapshot_interval_seconds` cadence for `duration_seconds`,
-    stop all chains, disconnect, and return per-(underlying, expiry)
+    """Use the shared TrueData WS connection, start each requested option
+    chain, sample snapshots at `snapshot_interval_seconds` cadence for
+    `duration_seconds`, stop all chains, and return per-(underlying, expiry)
     DataFrames.
 
-    Hard-fails (raises `TrueDataError`) if:
-      - The SDK cannot be imported / instantiated / connected.
-      - Starting any chain fails (e.g. trial account "User Subscription
-        Expired" error — see module docstring).
-      - 0 rows are captured across ALL chains (typically means account
-        not entitled for option chain, or all symbols are invalid).
+    Uses the shared `TDConnectionManager` singleton to avoid "User Already
+    Connected" errors from TrueData's server.
 
-    Parameters
-    ----------
-    requests : list[ChainRequest]
-        One entry per (underlying, expiry) pair. Caller is responsible for
-        de-duplication and length clamping to `TRUEDATA_CHAIN_MAX_PAIRS`.
-    duration_seconds : int
-        Total capture window. Caller clamps to
-        `[5, TRUEDATA_CHAIN_MAX_DURATION_SEC]`.
-    snapshot_interval_seconds : int
-        Time between snapshots. Caller clamps to
-        `[TRUEDATA_CHAIN_MIN_SNAPSHOT_INTERVAL_SEC,
-          TRUEDATA_CHAIN_MAX_SNAPSHOT_INTERVAL_SEC]`.
+    Hard-fails (raises `TrueDataError`) if:
+      - The shared connection cannot be established.
+      - Starting any chain fails.
+      - 0 rows are captured across ALL chains.
     """
     if not requests:
         raise TrueDataError("capture_option_chains called with empty requests list")
 
-    # Lazy import so the SDK is only loaded when actually needed; this keeps
-    # pytest collection fast for tests that don't touch TrueData.
-    try:
-        from truedata.websocket.TD_live import TD_live  # type: ignore
-    except ImportError as e:  # pragma: no cover - dependency is in requirements.txt
-        raise TrueDataError(
-            "truedata (v7+) package is not installed. "
-            "Run `pip install -r requirements.txt`."
-        ) from e
-
     started_at = datetime.now(timezone.utc)
     logger.info(
-        "Starting option-chain capture: %d chains, duration=%ds, snapshot_interval=%ds, "
-        "url=%s, port=%s",
+        "Starting option-chain capture: %d chains, duration=%ds, snapshot_interval=%ds",
         len(requests), duration_seconds, snapshot_interval_seconds,
-        settings.TRUEDATA_URL, settings.TRUEDATA_LIVE_PORT,
     )
 
-    # --- Patch the SDK's `exit()` calls before instantiating TD_live -----------
-    # The v7 truedata SDK calls the builtin `exit()` from
-    # `TD_live.start_option_chain()` whenever `get_atm()` or `OptionChain()`
-    # raises (e.g. trial-account "User Subscription Expired", bad symbol, bad
-    # expiry). That would kill the whole FastAPI worker. We replace `exit` in
-    # the SDK module's namespace with a function that raises `TrueDataError`
-    # instead, so we can catch it cleanly.
-    # NB: `start_option_chain` does NOT wrap `exit()` in its own try/except, so
-    # our patched `exit` will propagate as soon as it's called — perfect.
-    sdk_exit_raiser = _make_sdk_exit_raiser()
-    _patch_sdk_exit(TD_live, sdk_exit_raiser)
-
-    # We pass `full_feed=False` because the option-chain feature only needs
-    # the regular live-data subscription (the chain object reads from
-    # `td.live_data` directly). `full_feed=True` would trigger a master-
-    # contract download the trial account can't complete.
-    #
-    # IMPORTANT: TD_live.__init__() already calls self.connect() at the end
-    # (see truedata/websocket/TD_live.py). So we must NOT call td.connect()
-    # again — that would re-establish the websocket and likely hang. We wrap
-    # the constructor itself in try/except to catch connection errors.
-    td = None
+    # 1. Get the shared connection (creates it if not already connected).
     try:
-        td = TD_live(
-            login_id=settings.TRUEDATA_USERNAME,
-            password=settings.TRUEDATA_PASSWORD,
-            url=settings.TRUEDATA_URL,
-            live_port=settings.TRUEDATA_LIVE_PORT,
-            log_level=logging.WARNING,
-        )
-    except _SdkExitRaisedError as e:
-        # Our patched exit() raised this — the SDK was about to die because
-        # of a bad symbol/expiry OR the trial-account subscription error.
-        raise TrueDataError(
-            _format_subscription_error(e.original_message)
-        ) from e
-    except Exception as e:
-        msg = str(e)
-        if "Subscription Expired" in msg or "expired" in msg.lower():
-            raise TrueDataError(
-                _format_subscription_error(msg)
-            ) from e
-        raise TrueDataError(
-            f"Failed to create TD_live client: {type(e).__name__}: {e}"
-        ) from e
+        td = td_manager.get_connection()
+    except TrueDataConnectionError as e:
+        raise TrueDataError(str(e)) from e
 
-    # Start each requested chain. We track them in a list of (request, chain)
-    # tuples so we can iterate over them at snapshot time.
+    # Start each requested chain.
     chains: list[tuple[ChainRequest, Any, str]] = []
     try:
         for req in requests:
@@ -409,22 +360,27 @@ def capture_option_chains(
                     bid_ask=req.bid_ask,
                     greek=req.greek,
                 )
-            except _SdkExitRaisedError as e:
-                # start_option_chain called exit() — typically because
-                # get_atm() failed (trial account / bad symbol / bad expiry).
+            except SystemExit:
+                # SDK called exit() — our patch should prevent this, but
+                # catch SystemExit as a safety net.
                 raise TrueDataError(
                     f"Failed to start option chain for {req.underlying} "
-                    f"expiry {req.expiry}: {e.original_message}. "
+                    f"expiry {req.expiry}: SDK called exit(). "
                     "If using a trial account, option-chain entitlement is "
                     "not included — upgrade the TrueData plan."
-                ) from e
+                )
             except Exception as e:
-                # Defensive: any other SDK exception.
+                msg = str(e)
+                if "Subscription Expired" in msg or "expired" in msg.lower():
+                    raise TrueDataError(
+                        f"Failed to start option chain for {req.underlying} "
+                        f"expiry {req.expiry}: {msg}. "
+                        "If using a trial account, option-chain entitlement is "
+                        "not included — upgrade the TrueData plan."
+                    ) from e
                 raise TrueDataError(
                     f"Failed to start option chain for {req.underlying} "
-                    f"expiry {req.expiry}: {type(e).__name__}: {e}. "
-                    "If using a trial account, option-chain entitlement is "
-                    "not included — upgrade the TrueData plan."
+                    f"expiry {req.expiry}: {type(e).__name__}: {e}"
                 ) from e
             expiry_str = req.expiry.strftime("%Y-%m-%d")
             chains.append((req, chain, expiry_str))
@@ -433,14 +389,11 @@ def capture_option_chains(
                 req.underlying, expiry_str, req.chain_length, req.bid_ask, req.greek,
             )
 
-        # Wait a moment for the SDK's `update_chain` daemon thread to
-        # populate the dataframe from the live_data dict. The SDK itself
-        # sleeps 2s after start_live_data before starting the thread, so
-        # we wait an extra second beyond that.
+        # Wait for the SDK's update_chain daemon thread to populate the
+        # dataframe from live_data.
         time.sleep(3)
 
-        # Sample snapshots at the requested cadence. We use monotonic time
-        # so we don't drift if the system clock jumps.
+        # Sample snapshots at the requested cadence.
         snapshot_rows: dict[str, list[dict[str, Any]]] = {
             f"{req.underlying}_{expiry_str}": []
             for req, _, expiry_str in chains
@@ -460,17 +413,45 @@ def capture_option_chains(
                         req.underlying, expiry_str, e,
                     )
                     continue
-                rows = _row_from_chain_df(
-                    chain_df,
-                    underlying=req.underlying,
-                    expiry_str=expiry_str,
-                    snapshot_time=snapshot_time,
-                    include_greek=req.greek,
-                )
-                key = f"{req.underlying}_{expiry_str}"
-                snapshot_rows[key].extend(rows)
+                if chain_df is None or chain_df.empty:
+                    continue
+
+                # Reset index so 'symbols' becomes a regular column.
+                df = chain_df.reset_index() if "symbols" not in chain_df.columns else chain_df
+                if "symbols" in df.columns:
+                    df = df.rename(columns={"symbols": "symbol"})
+
+                for _, row_data in df.iterrows():
+                    symbol_name = str(row_data.get("symbol", ""))
+
+                    # Try to get greek data if requested.
+                    greek_data = None
+                    if any_greek:
+                        greek_data = _get_greek_data(td, symbol_name)
+
+                    enriched = _enrich_row_from_live_data(
+                        td=td,
+                        symbol_name=symbol_name,
+                        snapshot_time=snapshot_time,
+                        underlying=req.underlying,
+                        expiry_str=expiry_str,
+                        strike=row_data.get("strike"),
+                        option_type=str(row_data.get("type", "")),
+                        chain_ltp=row_data.get("ltp"),
+                        chain_oi=row_data.get("oi"),
+                        chain_prev_oi=row_data.get("prev_oi"),
+                        chain_bid=row_data.get("bid"),
+                        chain_bid_qty=row_data.get("bid_qty"),
+                        chain_ask=row_data.get("ask"),
+                        chain_ask_qty=row_data.get("ask_qty"),
+                        chain_ltq=row_data.get("ltq"),
+                        chain_volume=row_data.get("volume"),
+                        greek_data=greek_data,
+                    )
+                    key = f"{req.underlying}_{expiry_str}"
+                    snapshot_rows[key].append(enriched)
+
             snapshot_count += 1
-            # Sleep for the snapshot interval, but don't overshoot the deadline.
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
@@ -485,9 +466,8 @@ def capture_option_chains(
             f"Error during option-chain capture: {type(e).__name__}: {e}"
         ) from e
     finally:
-        # Stop all chains first (unsubscribes their option symbols), then
-        # disconnect the WS. Both are best-effort — if they fail we log and
-        # move on because we already have the captured data.
+        # Stop all chains (unsubscribes), but do NOT disconnect the shared
+        # connection — other callers may still be using it.
         for req, chain, _ in chains:
             try:
                 chain.stop_option_chain()
@@ -495,10 +475,6 @@ def capture_option_chains(
                 logger.warning(
                     "stop_option_chain failed for %s: %s", req.underlying, e
                 )
-        try:
-            td.disconnect()
-        except Exception as e:  # noqa: BLE001
-            logger.warning("TrueData disconnect failed: %s: %s", type(e).__name__, e)
 
     # Build per-(underlying, expiry) DataFrames.
     columns = OPTION_CHAIN_COLUMNS + (GREEK_COLUMNS if any_greek else [])
@@ -510,11 +486,9 @@ def capture_option_chains(
             frames[key] = pd.DataFrame(columns=columns)
             continue
         df = pd.DataFrame(rows, columns=columns)
-        # Sort by snapshot_time, then strike, then type — stable so the
-        # .xls reads naturally (chronological, then ascending strike, then
-        # CE before PE which matches the SDK's sort).
+        # Sort by Date Time, then Strike, then Type.
         df = df.sort_values(
-            ["snapshot_time", "strike", "type"], kind="stable"
+            ["Date Time", "Strike", "Type"], kind="stable"
         ).reset_index(drop=True)
         frames[key] = df
 

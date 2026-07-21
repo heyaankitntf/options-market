@@ -305,11 +305,19 @@ class TrueDataOptionChainExportRequest(BaseModel):
     then disconnects and returns per-(underlying, expiry) `.xls` files
     bundled into a ZIP.
 
-    Each `.xls` row is one strike × option-type × snapshot-time, with
-    20 base columns (snapshot_time, underlying, expiry, symbol, strike,
-    type, ltp, ltt, ltq, volume, price_change, price_change_perc, oi,
-    prev_oi, oi_change, oi_change_perc, bid, bid_qty, ask, ask_qty) plus
-    6 optional greek columns when any chain requests greeks.
+    Each `.xls` row is one strike x option-type x snapshot-time, with
+    23 base columns enriched from both the option-chain DataFrame and the
+    full tick-level `live_data` dict:
+
+        Symbol ID, Date Time, LTP, LTQ, ATP, TTQ,
+        Open, High, Low, Prev Close,
+        OI, Prev Open Int Close, Day's Turnover,
+        Special Tag, Tick Sequence No,
+        Bid, Bid Qty, Ask, Ask Qty,
+        Underlying, Expiry, Strike, Type
+
+    Plus 6 optional greek columns (IV, Delta, Theta, Gamma, Vega, Rho)
+    when any chain requests greeks.
 
     IMPORTANT — Account entitlement:
         Trial accounts get 'User Subscription Expired' on the option-chain

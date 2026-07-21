@@ -1,14 +1,14 @@
 """Standalone TrueData option-chain + tick-data API.
 
-NO AUTH — runs as a separate FastAPI app on port 8086 alongside the main
-authenticated app. Uses a single long-lived TD_live websocket connection
-with a daemon-thread auto-save loop, exactly matching the team-lead's
-reference script.
+NO AUTH — runs as a separate FastAPI app on port 8090 alongside the main
+authenticated app. Uses the shared TDConnectionManager singleton so it
+doesn't conflict with other parts of the app that also need the TrueData
+WebSocket connection (fixing the "User Already Connected" error).
 
 Run with:
     .venv/bin/python -m app.standalone_truedata
 or:
-    .venv/bin/uvicorn app.standalone_truedata:app --host 0.0.0.0 --port 8086
+    .venv/bin/uvicorn app.standalone_truedata:app --host 0.0.0.0 --port 8090
 
 Endpoints (all public, no JWT):
     GET /                                -> status
@@ -34,45 +34,33 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 
 # Load .env from the CWD so the standalone picks up the same TrueData
-# credentials as the main app. pydantic-settings does this for the main
-# app automatically; the standalone uses os.environ directly, so we need
-# to call load_dotenv() ourselves.
+# credentials as the main app.
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:  # pragma: no cover
-    # python-dotenv is a transitive dep of pydantic-settings, so this should
-    # never fire. If it does, env vars still work — .env just isn't loaded.
     pass
 
-# TrueData is imported lazily so importing this module doesn't crash if the
-# SDK isn't installed yet (e.g. during testing).
-try:
-    from truedata import TD_live
-except ImportError:  # pragma: no cover
-    TD_live = None  # type: ignore
+# Import the shared connection manager — this prevents "User Already Connected"
+# errors by ensuring a single TD_live instance across the whole process.
+from app.services.truedata_connection_manager import td_manager
 
 # ---------------- Config ----------------
-# All of these can be overridden via env vars (or .env — load_dotenv() above).
-# Defaults match the team-lead's reference script exactly.
 AUTO_SAVE_INTERVAL_SECONDS = int(os.environ.get("AUTO_SAVE_INTERVAL_SECONDS", "30"))
-API_PORT = int(os.environ.get("API_PORT", "8086"))
-
-TRUEDATA_USERNAME = os.environ.get("TRUEDATA_USERNAME", "Trial126")
-TRUEDATA_PASSWORD = os.environ.get("TRUEDATA_PASSWORD", "sand126")
-TRUEDATA_LIVE_PORT = int(os.environ.get("TRUEDATA_LIVE_PORT", "8086"))
+# NOTE: Changed default from 8086 to 8090 to avoid conflict with
+# TRUEDATA_LIVE_PORT (which defaults to 8086). Running the API on the
+# same port as the TrueData WS connection was causing confusion.
+API_PORT = int(os.environ.get("API_PORT", "8090"))
 
 # Symbols for live tick + bidask stream.
 MY_SYMBOLS = ["BANKNIFTY-I", "SBIN-I", "SBIN", "NIFTY 50"]
 
 # Pre-configured option chains. Each entry: (key, underlying, expiry, chain_length, bid_ask, greek).
-# Adjust expiry dates as needed — they must be valid NSE F&O expiry dates.
 PRESET_CHAINS = [
     ("nifty", "NIFTY", dt(2026, 7, 28), 20, True, False),
 ]
 
 # ---------------- Globals (populated at startup) ----------------
-td_obj = None  # type: ignore
 CHAIN_MAP: dict[str, object] = {}
 
 # ---------------- Tick data storage ----------------
@@ -171,27 +159,22 @@ app = FastAPI(title="TrueData Option Chain & Tick Data API (no-auth)")
 
 @app.on_event("startup")
 def _startup() -> None:
-    """Open the long-lived TD_live WS, start live data + preset chains,
-    register callbacks, and launch the auto-save daemon thread."""
-    global td_obj
+    """Open the shared TD_live WS (via connection manager), start live data
+    + preset chains, register callbacks, and launch the auto-save daemon."""
+    global td_obj  # noqa: F824 — kept for backward compat in endpoint checks
 
-    if TD_live is None:
-        # We still start the app — endpoints will return 503 with a clear
-        # message. This makes the container boot successfully even if
-        # truedata isn't installed yet.
-        print("[STARTUP] truedata SDK is not installed — endpoints will return 503")
+    print("[STARTUP] Connecting to TrueData via shared connection manager...")
+
+    try:
+        td_obj = td_manager.connect()
+    except Exception as e:
+        print(
+            f"[STARTUP] Failed to connect to TrueData: {type(e).__name__}: {e}. "
+            "Endpoints will return 503."
+        )
+        td_obj = None
         return
 
-    print(
-        f"[STARTUP] Connecting to TrueData as {TRUEDATA_USERNAME} "
-        f"on port {TRUEDATA_LIVE_PORT}..."
-    )
-    td_obj = TD_live(
-        TRUEDATA_USERNAME,
-        TRUEDATA_PASSWORD,
-        live_port=TRUEDATA_LIVE_PORT,
-        log_level=logging.WARNING,
-    )
     td_obj.start_live_data(MY_SYMBOLS)
     time.sleep(1)
 
@@ -206,8 +189,6 @@ def _startup() -> None:
             CHAIN_MAP[key] = chain
             print(f"[STARTUP] Started option chain: {key} ({underlying} {expiry.date()})")
         except SystemExit:
-            # SDK calls exit() on failure (e.g. trial account 'User Subscription
-            # Expired'). We catch SystemExit so the worker doesn't die.
             print(
                 f"[STARTUP] Failed to start chain {key} ({underlying} {expiry.date()}) "
                 f"— SDK called exit(). Likely 'User Subscription Expired' for trial "
@@ -284,19 +265,23 @@ async def log_requests(request: Request, call_next):
 
 # ---------------- Endpoints (no auth) ----------------
 
+# Keep a module-level reference for endpoint checks.
+td_obj = None  # type: ignore
+
+
 @app.get("/")
 def root():
     return {
         "status": "running",
         "available_endpoints": list(CHAIN_MAP.keys()),
-        "truedata_connected": td_obj is not None,
+        "truedata_connected": td_manager.is_connected,
         "tick_records_captured": len(tick_records),
     }
 
 
 @app.get("/option-chain/all")
 def get_all_chains():
-    if td_obj is None:
+    if not td_manager.is_connected:
         raise HTTPException(status_code=503, detail="TrueData SDK not initialized")
     result: dict[str, list] = {}
     for name, chain_obj in CHAIN_MAP.items():
@@ -307,7 +292,7 @@ def get_all_chains():
 
 @app.get("/option-chain/{symbol}")
 def get_option_chain(symbol: str):
-    if td_obj is None:
+    if not td_manager.is_connected:
         raise HTTPException(status_code=503, detail="TrueData SDK not initialized")
     symbol = symbol.lower()
     if symbol not in CHAIN_MAP:
@@ -323,7 +308,7 @@ def get_option_chain(symbol: str):
 
 @app.get("/export/all")
 def export_all_excel():
-    if td_obj is None:
+    if not td_manager.is_connected:
         raise HTTPException(status_code=503, detail="TrueData SDK not initialized")
     filepath = save_all_chains_to_single_excel()
     return {"status": "saved", "file": filepath}
@@ -339,7 +324,7 @@ def export_ticks_excel():
 
 @app.get("/export/{symbol}")
 def export_chain_excel(symbol: str):
-    if td_obj is None:
+    if not td_manager.is_connected:
         raise HTTPException(status_code=503, detail="TrueData SDK not initialized")
     symbol = symbol.lower()
     if symbol not in CHAIN_MAP:
