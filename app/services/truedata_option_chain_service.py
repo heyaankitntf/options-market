@@ -29,7 +29,11 @@ and pulling the additional fields the user requested.
 
 Output schema
 -------------
-Each row in the output .xls is one strike × option-type × snapshot-time:
+Call (CE) and Put (PE) data are segregated into **separate .xls files**
+within the ZIP. For each (underlying, expiry) pair, the ZIP contains two
+files: `..._CE.xls` and `..._PE.xls`.
+
+Each row in every .xls is one strike × snapshot-time:
 
     Symbol ID, Date Time, LTP, LTQ, ATP, TTQ,
     Open, High, Low, Prev Close,
@@ -38,10 +42,9 @@ Each row in the output .xls is one strike × option-type × snapshot-time:
     Bid, Bid Qty, Ask, Ask Qty,
     Underlying, Expiry, Strike, Type
 
-This matches the spec the user requested exactly. The last 4 columns
-(Underlying, Expiry, Strike, Type) are appended after the tick-level fields
-for easy identification while keeping the first 19 columns in the same
-order as the tick export.
+This matches the spec the user requested exactly. The `Type` column is
+always present (will be "CE" in the CE file, "PE" in the PE file) so
+downstream consumers can identify the option type even if files are merged.
 """
 
 from __future__ import annotations
@@ -124,9 +127,11 @@ class ChainRequest:
 class ChainCaptureResult:
     """Result of a `capture_option_chains` run.
 
-    `frames` maps each (underlying, expiry) pair → its DataFrame (columns
-    in `OPTION_CHAIN_COLUMNS` order, plus `GREEK_COLUMNS` if any chain
-    requested greeks). The key format is `"{UNDERLYING}_{YYYY-MM-DD}"`.
+    `frames` maps each (underlying, expiry, option_type) triplet → its
+    DataFrame. The key format is `"{UNDERLYING}_{YYYY-MM-DD}_CE"` or
+    `"{UNDERLYING}_{YYYY-MM-DD}_PE"`, so Call and Put data are already
+    segregated into separate frames (each becoming a separate .xls file
+    in the ZIP).
     """
     frames: dict[str, pd.DataFrame]
     capture_started_at: str
@@ -394,10 +399,12 @@ def capture_option_chains(
         time.sleep(3)
 
         # Sample snapshots at the requested cadence.
-        snapshot_rows: dict[str, list[dict[str, Any]]] = {
-            f"{req.underlying}_{expiry_str}": []
-            for req, _, expiry_str in chains
-        }
+        # Separate CE and PE rows so they go into different .xls files.
+        snapshot_rows: dict[str, list[dict[str, Any]]] = {}
+        for req, _, expiry_str in chains:
+            base_key = f"{req.underlying}_{expiry_str}"
+            snapshot_rows[f"{base_key}_CE"] = []
+            snapshot_rows[f"{base_key}_PE"] = []
         deadline = time.monotonic() + duration_seconds
         snapshot_count = 0
         any_greek = any(req.greek for req, _, _ in chains)
@@ -448,7 +455,10 @@ def capture_option_chains(
                         chain_volume=row_data.get("volume"),
                         greek_data=greek_data,
                     )
-                    key = f"{req.underlying}_{expiry_str}"
+                    # Route CE rows to _CE key, PE rows to _PE key.
+                    opt_type = str(row_data.get("type", "")).upper()
+                    suffix = "CE" if opt_type == "CE" else "PE"
+                    key = f"{req.underlying}_{expiry_str}_{suffix}"
                     snapshot_rows[key].append(enriched)
 
             snapshot_count += 1

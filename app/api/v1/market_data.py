@@ -368,9 +368,9 @@ def export_truedata_option_chain_xls(
     cadence for `duration_seconds`, then return the captured rows as a ZIP
     of legacy `.xls` files (one per (underlying, expiry) pair).
 
-    Each `.xls` row is one strike x option-type x snapshot-time, with
-    23 base columns enriched from both the option-chain DataFrame and the
-    full tick-level `live_data` dict:
+    Each `.xls` row is one strike x snapshot-time, with 23 base columns
+    enriched from both the option-chain DataFrame and the full tick-level
+    `live_data` dict:
 
         Symbol ID, Date Time, LTP, LTQ, ATP, TTQ,
         Open, High, Low, Prev Close,
@@ -381,6 +381,12 @@ def export_truedata_option_chain_xls(
 
     Plus 6 optional greek columns (IV, Delta, Theta, Gamma, Vega, Rho)
     when any chain requests `greek=true`.
+
+    IMPORTANT — Separate Call/Put files:
+        Call (CE) and Put (PE) data are written to SEPARATE .xls files.
+        For each (underlying, expiry) pair, the ZIP contains:
+          - `NIFTY_2026-07-30_CE.xls` — Call option chain rows
+          - `NIFTY_2026-07-30_PE.xls` — Put option chain rows
 
     The endpoint is designed for the team lead's "current expiry + next
     expiry" use case — pass two `OptionChainSpec` entries with the same

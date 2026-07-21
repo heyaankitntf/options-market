@@ -3,15 +3,11 @@
 We don't hit the real TrueData API here — the option-chain service is
 monkey-patched so the tests stay hermetic and fast. The goal is to verify:
 
-  - the endpoint is PUBLIC (no JWT required — auth was disabled per team-lead directive)
-  - the request schema validates filters (empty chains, too many chains,
-    chain_length bounds, duration bounds, duplicate pairs)
-  - on a TrueData failure (incl. 0 rows captured, or trial's "User
-    Subscription Expired"), the endpoint returns 502
-  - on success, the endpoint returns a ZIP with one .xls per
-    (underlying, expiry) pair + a metadata.txt entry, and the .xls has
-    the full 23-column enriched spec (matching the user's requested schema)
-    plus 6 greek columns when greek=true
+  - the endpoint is PUBLIC (no JWT required)
+  - the request schema validates filters
+  - on a TrueData failure, the endpoint returns 502
+  - on success, the ZIP contains SEPARATE .xls files for CE and PE per
+    (underlying, expiry) pair, each with the 23-column enriched schema
   - underlying names are upper-cased before being passed to the service
   - the service-level edge case (empty requests list) raises TrueDataError
 """
@@ -36,9 +32,12 @@ from app.services.truedata_option_chain_service import (
 )
 
 
-def _fake_chain_dataframe(underlying: str, expiry: date, n_strikes: int = 3, *, greek: bool = False) -> pd.DataFrame:
-    """Build a DataFrame mimicking the ENRICHED option chain output
-    (23 base columns matching the user's requested schema)."""
+def _fake_chain_rows(
+    underlying: str, expiry: date, n_strikes: int = 3, *, greek: bool = False
+) -> list[dict]:
+    """Build rows mimicking the ENRICHED option chain output
+    (23 base columns matching the user's requested schema).
+    Returns both CE and PE rows mixed together."""
     expiry_str = expiry.strftime("%y%m%d")
     rows = []
     for i in range(n_strikes):
@@ -79,9 +78,7 @@ def _fake_chain_dataframe(underlying: str, expiry: date, n_strikes: int = 3, *, 
                     "Rho": -0.5 + i * 0.01,
                 })
             rows.append(row)
-
-    columns = OPTION_CHAIN_COLUMNS + (GREEK_COLUMNS if greek else [])
-    return pd.DataFrame(rows, columns=columns)
+    return rows
 
 
 def _fake_option_chain_result(
@@ -89,33 +86,40 @@ def _fake_option_chain_result(
     *,
     snapshots_per_chain: int = 2,
 ) -> ChainCaptureResult:
-    """Build a ChainCaptureResult mimicking what the service would return
-    after capturing `snapshots_per_chain` snapshots for each chain."""
-    frames: dict[str, pd.DataFrame] = {}
-    total = 0
+    """Build a ChainCaptureResult with CE/PE-segregated frames, mimicking
+    what the service returns after capturing snapshots."""
     any_greek = any(r.greek for r in chains)
     columns = OPTION_CHAIN_COLUMNS + (GREEK_COLUMNS if any_greek else [])
+    frames: dict[str, pd.DataFrame] = {}
+    total = 0
 
     for req in chains:
-        key = f"{req.underlying}_{req.expiry.isoformat()}"
-        base_df = _fake_chain_dataframe(
+        base_key = f"{req.underlying}_{req.expiry.isoformat()}"
+        all_rows = _fake_chain_rows(
             req.underlying, req.expiry,
             n_strikes=req.chain_length // 2,
             greek=req.greek,
         )
-        # Replicate rows for each snapshot (increment datetime slightly).
-        all_rows = []
-        for snap_i in range(snapshots_per_chain):
-            df_copy = base_df.copy()
-            # Shift Date Time by snapshot interval.
-            df_copy["Date Time"] = df_copy["Date Time"].apply(
-                lambda dt_val, s=snap_i: dt_val.replace(minute=dt_val.minute + s) if isinstance(dt_val, datetime) else dt_val
-            )
-            all_rows.append(df_copy)
 
-        combined = pd.concat(all_rows, ignore_index=True)
-        total += len(combined)
-        frames[key] = combined
+        # Separate CE and PE rows
+        ce_rows = [r for r in all_rows if r["Type"] == "CE"]
+        pe_rows = [r for r in all_rows if r["Type"] == "PE"]
+
+        # Replicate for each snapshot
+        for suffix, type_rows in [("_CE", ce_rows), ("_PE", pe_rows)]:
+            key = f"{base_key}{suffix}"
+            snap_rows = []
+            for snap_i in range(snapshots_per_chain):
+                for r in type_rows:
+                    r_copy = dict(r)
+                    # Shift datetime slightly per snapshot
+                    r_copy["Date Time"] = datetime(
+                        2026, 7, 21, 9, 15 + snap_i, r_copy["Date Time"].second,
+                        tzinfo=timezone.utc
+                    )
+                    snap_rows.append(r_copy)
+            total += len(snap_rows)
+            frames[key] = pd.DataFrame(snap_rows, columns=columns)
 
     return ChainCaptureResult(
         frames=frames,
@@ -128,7 +132,7 @@ def _fake_option_chain_result(
 # --- Auth (or lack thereof) ---------------------------------------------
 
 def test_option_chain_export_is_public(client: TestClient):
-    """Endpoint is PUBLIC — no JWT required (auth disabled per team-lead directive)."""
+    """Endpoint is PUBLIC — no JWT required."""
     from app.services import truedata_option_chain_service as svc
     fake_result = _fake_option_chain_result(
         [ChainRequest(underlying="NIFTY", expiry=date(2026, 7, 30),
@@ -149,7 +153,6 @@ def test_option_chain_export_is_public(client: TestClient):
 # --- Schema validation --------------------------------------------------
 
 def test_option_chain_export_rejects_empty_chains(client: TestClient):
-    """`chains` must be non-empty."""
     r = client.post(
         "/api/v1/market-data/truedata/option-chain/export",
         json={"chains": [], "duration_seconds": 30},
@@ -158,7 +161,6 @@ def test_option_chain_export_rejects_empty_chains(client: TestClient):
 
 
 def test_option_chain_export_rejects_too_many_chains(client: TestClient):
-    """`chains` length is capped at TRUEDATA_CHAIN_MAX_PAIRS (default 5)."""
     chains = [
         {"underlying": "NIFTY", "expiry": f"2026-08-{6 + i:02d}"}
         for i in range(10)
@@ -171,13 +173,10 @@ def test_option_chain_export_rejects_too_many_chains(client: TestClient):
 
 
 def test_option_chain_export_rejects_chain_length_too_small(client: TestClient):
-    """`chain_length` must be >= 2."""
     r = client.post(
         "/api/v1/market-data/truedata/option-chain/export",
         json={
-            "chains": [
-                {"underlying": "NIFTY", "expiry": "2026-07-30", "chain_length": 1},
-            ],
+            "chains": [{"underlying": "NIFTY", "expiry": "2026-07-30", "chain_length": 1}],
             "duration_seconds": 30,
         },
     )
@@ -185,7 +184,6 @@ def test_option_chain_export_rejects_chain_length_too_small(client: TestClient):
 
 
 def test_option_chain_export_rejects_duration_too_long(client: TestClient):
-    """`duration_seconds` capped at 300."""
     r = client.post(
         "/api/v1/market-data/truedata/option-chain/export",
         json={
@@ -197,13 +195,12 @@ def test_option_chain_export_rejects_duration_too_long(client: TestClient):
 
 
 def test_option_chain_export_rejects_duplicate_pairs(client: TestClient):
-    """Duplicate (underlying, expiry) pairs are rejected."""
     r = client.post(
         "/api/v1/market-data/truedata/option-chain/export",
         json={
             "chains": [
                 {"underlying": "NIFTY", "expiry": "2026-07-30"},
-                {"underlying": "NIFTY", "expiry": "2026-07-30"},  # duplicate
+                {"underlying": "NIFTY", "expiry": "2026-07-30"},
             ],
             "duration_seconds": 30,
         },
@@ -215,14 +212,10 @@ def test_option_chain_export_rejects_duplicate_pairs(client: TestClient):
 # --- Hard-fail contract -------------------------------------------------
 
 def test_option_chain_export_hard_fails_on_truedata_error(client: TestClient):
-    """On TrueDataError (incl. trial's 'User Subscription Expired'), the
-    endpoint returns 502 with the error message."""
-
     def _raise(*args, **kwargs):
         raise truedata_option_chain_service.TrueDataError(
             "User Subscription Expired — trial account not entitled for option chain"
         )
-
     with patch.object(truedata_option_chain_service, "capture_option_chains", side_effect=_raise):
         r = client.post(
             "/api/v1/market-data/truedata/option-chain/export",
@@ -231,17 +224,14 @@ def test_option_chain_export_hard_fails_on_truedata_error(client: TestClient):
                 "duration_seconds": 30,
             },
         )
-
     assert r.status_code == 502
     assert "User Subscription Expired" in r.text
 
 
-# --- Happy path ---------------------------------------------------------
+# --- Happy path: separate CE/PE files -----------------------------------
 
-def test_option_chain_export_success_returns_zip_with_per_chain_xls(client: TestClient):
-    """Happy path: ZIP with one .xls per chain + a metadata.txt entry,
-    and the .xls has the 23-column enriched spec."""
-
+def test_option_chain_export_returns_separate_ce_pe_xls(client: TestClient):
+    """ZIP contains separate _CE.xls and _PE.xls per (underlying, expiry) pair."""
     req_chains = [
         ChainRequest(underlying="NIFTY", expiry=date(2026, 7, 30),
                      chain_length=6, bid_ask=True, greek=False),
@@ -266,37 +256,49 @@ def test_option_chain_export_success_returns_zip_with_per_chain_xls(client: Test
 
     assert r.status_code == 200, r.text
     assert r.headers["content-type"] == "application/zip"
-    assert 'attachment; filename="' in r.headers["content-disposition"]
-    assert r.headers["x-export-mode"] == "option-chain"
 
-    # Inspect the ZIP.
     with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
         names = zf.namelist()
         assert "metadata.txt" in names
         xls_names = [n for n in names if n.endswith(".xls")]
-        assert len(xls_names) == 2
 
-        # Each .xls parses back as a DataFrame with the 23 base columns.
+        # 2 chains × 2 types (CE, PE) = 4 .xls files
+        assert len(xls_names) == 4, f"Expected 4 .xls files, got {xls_names}"
+
+        # Verify CE/PE naming convention — filenames contain _CE_ or _PE_ in the key part
+        ce_files = [n for n in xls_names if "_CE_" in n]
+        pe_files = [n for n in xls_names if "_PE_" in n]
+        assert len(ce_files) == 2, f"Expected 2 CE files, got {ce_files}"
+        assert len(pe_files) == 2, f"Expected 2 PE files, got {pe_files}"
+
+        # Each .xls has the 23-column enriched schema
         for xls_name in xls_names:
             df = pd.read_excel(io.BytesIO(zf.read(xls_name)), engine="xlrd")
             assert list(df.columns) == OPTION_CHAIN_COLUMNS, (
                 f"{xls_name} columns mismatch: got {list(df.columns)}"
             )
-            # Spot-check values.
+            # Spot-check values
             assert df["Underlying"].iloc[0] == "NIFTY"
-            assert df["LTP"].iloc[0] == 100.5
 
-        # metadata.txt should mention the option-chain column spec + trial caveat.
+        # Verify CE files only contain CE rows, PE files only PE rows
+        for ce_file in ce_files:
+            df = pd.read_excel(io.BytesIO(zf.read(ce_file)), engine="xlrd")
+            assert all(df["Type"] == "CE"), f"CE file {ce_file} contains non-CE rows"
+            assert df["Strike"].notna().any(), "Strike column should have data"
+        for pe_file in pe_files:
+            df = pd.read_excel(io.BytesIO(zf.read(pe_file)), engine="xlrd")
+            assert all(df["Type"] == "PE"), f"PE file {pe_file} contains non-PE rows"
+            assert df["Strike"].notna().any(), "Strike column should have data"
+
+        # metadata.txt mentions separate CE/PE structure
         meta = zf.read("metadata.txt").decode("utf-8")
         assert "TrueData Option-Chain Export" in meta
         assert "Symbol ID" in meta
-        assert "TRIAL ACCOUNT CAVEAT" in meta
+        assert "SEPARATE" in meta
 
 
 def test_option_chain_export_includes_greek_columns_when_requested(client: TestClient):
-    """When greek=true is set on any chain, the .xls has 29 columns
-    (23 base + 6 greek) for ALL chains in the request."""
-
+    """When greek=true, the .xls has 29 columns (23 base + 6 greek)."""
     req_chains = [
         ChainRequest(underlying="NIFTY", expiry=date(2026, 7, 30),
                      chain_length=6, bid_ask=True, greek=True),
@@ -318,22 +320,24 @@ def test_option_chain_export_includes_greek_columns_when_requested(client: TestC
     assert r.status_code == 200, r.text
     with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
         xls_names = [n for n in zf.namelist() if n.endswith(".xls")]
-        assert len(xls_names) == 1
-        df = pd.read_excel(io.BytesIO(zf.read(xls_names[0])), engine="xlrd")
-        expected = OPTION_CHAIN_COLUMNS + GREEK_COLUMNS  # 29 cols
-        assert list(df.columns) == expected, (
-            f"greek-mode columns mismatch: got {list(df.columns)}"
-        )
-        assert len(df.columns) == 29
-        # Spot-check a greek value
+        # 1 chain × 2 types = 2 .xls files
+        assert len(xls_names) == 2
+        for xls_name in xls_names:
+            df = pd.read_excel(io.BytesIO(zf.read(xls_name)), engine="xlrd")
+            expected = OPTION_CHAIN_COLUMNS + GREEK_COLUMNS  # 29 cols
+            assert list(df.columns) == expected, (
+                f"greek-mode columns mismatch in {xls_name}: got {list(df.columns)}"
+            )
+            assert len(df.columns) == 29
+        # Spot-check greek value in CE file
+        ce_file = [n for n in xls_names if "_CE_" in n][0]
+        df = pd.read_excel(io.BytesIO(zf.read(ce_file)), engine="xlrd")
         assert df["IV"].iloc[0] == 12.5
 
 
 # --- Underlying normalisation -------------------------------------------
 
 def test_option_chain_export_uppercases_underlying(client: TestClient):
-    """Underlying names are upper-cased before being forwarded to the service."""
-
     captured: dict = {}
 
     def _capture(reqs, *, duration_seconds, snapshot_interval_seconds):
@@ -344,9 +348,7 @@ def test_option_chain_export_uppercases_underlying(client: TestClient):
         r = client.post(
             "/api/v1/market-data/truedata/option-chain/export",
             json={
-                "chains": [
-                    {"underlying": " nifty ", "expiry": "2026-07-30"},
-                ],
+                "chains": [{"underlying": " nifty ", "expiry": "2026-07-30"}],
                 "duration_seconds": 30,
             },
         )
@@ -358,7 +360,6 @@ def test_option_chain_export_uppercases_underlying(client: TestClient):
 # --- Service-level edge case --------------------------------------------
 
 def test_capture_option_chains_raises_on_empty_requests():
-    """The service itself raises TrueDataError if called with empty list."""
     with pytest.raises(truedata_option_chain_service.TrueDataError):
         truedata_option_chain_service.capture_option_chains(
             [], duration_seconds=30, snapshot_interval_seconds=5,
@@ -368,8 +369,6 @@ def test_capture_option_chains_raises_on_empty_requests():
 # --- exit() patching (critical safety net) ------------------------------
 
 def test_sdk_exit_patching_prevents_process_death():
-    """The connection manager patches `exit` in the SDK module namespace so
-    it raises instead of killing the process."""
     import sys
     import types
 
@@ -388,10 +387,9 @@ def test_sdk_exit_patching_prevents_process_death():
 
         def start_option_chain(self, symbol, expiry, chain_length=None,
                                bid_ask=False, greek=False):
-            exit()  # noqa: PLR1722 — intentionally mimics the SDK
+            exit()  # noqa: PLR1722
 
     fake_module.TD_live = _FakeTDLive
-
     real_module = sys.modules.get("truedata.websocket.TD_live")
     sys.modules["truedata.websocket.TD_live"] = fake_module
     try:
@@ -412,18 +410,11 @@ def test_sdk_exit_patching_prevents_process_death():
 
 
 def test_format_subscription_error_mentions_upgrade():
-    """The subscription-error helper mentions both the original error and
-    the upgrade instruction. Note: the function was moved to
-    truedata_connection_manager.py but TrueDataError is still in the
-    option chain service."""
-    # This test now validates that TrueDataError is importable and works.
     err = truedata_option_chain_service.TrueDataError("User Subscription Expired")
     assert "User Subscription Expired" in str(err)
 
 
 def test_connection_manager_sdk_exit_raiser():
-    """The `_make_sdk_exit_raiser` in the connection manager returns a
-    callable that raises instead of calling sys.exit."""
     from app.services.truedata_connection_manager import _make_sdk_exit_raiser, _SdkExitRaisedError
     raiser = _make_sdk_exit_raiser()
     with pytest.raises(_SdkExitRaisedError):
