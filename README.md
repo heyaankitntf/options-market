@@ -358,214 +358,175 @@ pattern.
 
 ---
 
-## TrueData option-chain export (live snapshots)
+## Standalone TrueData option-chain API (NO AUTH, port 8086)
 
-Captures live option-chain snapshots for one or more `(underlying, expiry)`
-pairs at a configurable cadence and returns them as a ZIP of `.xls` files
-(one per chain). Designed for the team lead's "current expiry + next expiry"
-use case — pass two chains with the same underlying and adjacent weekly
-expiries to capture both in a single request.
+The option-chain endpoint has been moved out of the JWT-protected main
+app into a standalone FastAPI app at `app/standalone_truedata.py`. It
+runs on a separate port (default `8086`) alongside the main app, has
+**no authentication**, and keeps a single long-lived `TD_live` websocket
+open for the entire process lifetime — exactly matching the team-lead's
+reference script.
 
-### Endpoint
+### Why standalone / no-auth?
 
-```
-POST /api/v1/market-data/truedata/option-chain/export
-Authorization: Bearer <jwt>
-Content-Type: application/json
-```
+The previous design (JWT-protected `POST /api/v1/market-data/truedata/option-chain/export`)
+opened a fresh `TD_live` per request, which:
 
-### What this endpoint does
+1. Re-triggered the SDK's "User Subscription Expired" dance on every
+   call for trial accounts (the SDK calls `exit()` on the failed
+   subscription, which we patched to raise instead — but each request
+   still paid the full WS connect + disconnect cost).
+2. Required JWT auth, which made it unusable from simple scripts / curl /
+   browser without first minting a token.
+3. Didn't match the team-lead's reference script, which keeps ONE
+   `td_obj` alive for the whole process and lets a daemon thread
+   accumulate ticks.
 
-1. Opens a `TD_live` WebSocket to `push.truedata.in:<live_port>` (uses the
-   v7 `truedata` SDK — distinct from the v5 `truedata-ws` SDK used by the
-   historical + tick endpoints).
-2. For each entry in `chains`, calls `td.start_option_chain(symbol, expiry,
-   chain_length, bid_ask, greek)`. The SDK subscribes to
-   `chain_length × 2` option contracts (CE+PE) centred on ATM, then runs
-   a daemon thread that keeps the chain's dataframe updated from
-   `td.live_data`.
-3. Samples each chain's dataframe at `snapshot_interval_seconds` cadence
-   for the full `duration_seconds`, projecting every snapshot onto the
-   flat row schema below.
-4. Stops all chains, disconnects, bundles per-(underlying, expiry) rows
-   into one `.xls` per chain + a `metadata.txt`, returns the ZIP.
+The standalone fixes all three: one connection, no auth, GET endpoints
+that return JSON directly.
 
-### ⚠️ Account entitlement — trial accounts do NOT work
+### Run it
 
-TrueData trial accounts do **not** include option-chain entitlement.
-Calling this endpoint with the default `Trial126` / `sand126` credentials
-returns HTTP 502 with:
+```bash
+# From the repo root, with .venv activated:
+.venv/bin/python -m app.standalone_truedata
 
-```
-TrueData error: TrueData reports 'User Subscription Expired' — this account
-is not entitled for option-chain data. Upgrade the TrueData plan to one that
-includes NSE F&O option chain.
+# Or via uvicorn directly:
+.venv/bin/uvicorn app.standalone_truedata:app --host 0.0.0.0 --port 8086
 ```
 
-The endpoint will work the moment the account is upgraded to a plan with
-NSE F&O option-chain support — **no code changes required**. The unit
-tests in `tests/test_market_data_option_chain.py` exercise the full
-pipeline with a mocked SDK so the endpoint logic is verified regardless
-of account entitlement.
+The app reads `.env` from the CWD via `python-dotenv`, so it picks up
+the same `TRUEDATA_USERNAME` / `TRUEDATA_PASSWORD` / `TRUEDATA_LIVE_PORT`
+values as the main app.
 
-### Request body
+### Endpoints (all public, no JWT)
 
-```json
-{
-  "chains": [
-    {
-      "underlying": "NIFTY",
-      "expiry": "2026-07-30",
-      "chain_length": 10,
-      "bid_ask": true,
-      "greek": false
-    },
-    {
-      "underlying": "NIFTY",
-      "expiry": "2026-08-27",
-      "chain_length": 10,
-      "bid_ask": true,
-      "greek": false
-    }
-  ],
-  "duration_seconds": 60,
-  "snapshot_interval_seconds": 5,
-  "segment": "NSE F&O"
-}
-```
+| Method | Path                          | Description                                             |
+|--------|-------------------------------|---------------------------------------------------------|
+| GET    | `/`                           | Status + available chains + tick count                  |
+| GET    | `/option-chain/{symbol}`      | Current chain as JSON records (e.g. `/option-chain/nifty`) |
+| GET    | `/option-chain/all`           | All preset chains as JSON                               |
+| GET    | `/export/{symbol}`            | Save one chain to `.xlsx` on disk, return filepath      |
+| GET    | `/export/all`                 | Save all chains to a single `.xlsx` (one sheet each)    |
+| GET    | `/export/ticks`               | Save captured ticks to `.xlsx` on disk, return filepath |
+| GET    | `/ticks`                      | Last 100 captured tick records as JSON                  |
 
-#### Field reference
+### What the app does at startup
 
-| Field                       | Type    | Default | Bounds             | Notes |
-|-----------------------------|---------|---------|--------------------|-------|
-| `chains`                    | array   | —       | 1..5 entries       | Each entry is an `OptionChainSpec`. Duplicate `(underlying, expiry)` pairs are rejected. |
-| `chains[].underlying`       | string  | —       | 1..20 chars        | Bare name, no expiry/strike suffix. Normalised to uppercase. |
-| `chains[].expiry`           | date    | —       | YYYY-MM-DD         | Must be a valid trading expiry for the underlying. NIFTY/BANKNIFTY/FINNIFTY/MIDCPNIFTY = weekly Thursday; SENSEX = weekly Tuesday. |
-| `chains[].chain_length`     | int     | `10`    | 2..100             | Total strikes centred on ATM. Generates `2 × chain_length` contracts. Trial accounts cap at 50 contracts total. |
-| `chains[].bid_ask`          | bool    | `true`  | —                  | Include best bid/ask price + quantity columns. |
-| `chains[].greek`            | bool    | `false` | —                  | Request greeks (iv, delta, theta, gamma, vega, rho). Adds 6 columns to ALL chains in the request. Requires a plan with greek entitlement. |
-| `duration_seconds`          | int     | `60`    | 5..300             | Total capture window. |
-| `snapshot_interval_seconds` | int     | `5`     | 1..60              | Time between snapshots. Lower = more snapshots but more rows. |
-| `segment`                   | string  | `NSE F&O` | enum             | Metadata/filename grouping only. Set to `BSE F&O` for SENSEX. |
+1. Opens a `TD_live` websocket to `push.truedata.in:<TRUEDATA_LIVE_PORT>`
+   using `TRUEDATA_USERNAME` / `TRUEDATA_PASSWORD`.
+2. Subscribes to live tick data for `MY_SYMBOLS` (default:
+   `["BANKNIFTY-I", "SBIN-I", "SBIN", "NIFTY 50"]`).
+3. Starts one option chain per entry in `PRESET_CHAINS` (default:
+   NIFTY 28-Jul-2026, chain_length=20, bid_ask=true, greek=false).
+   Edit `PRESET_CHAINS` at the top of `app/standalone_truedata.py` to
+   add more chains (BANKNIFTY, FINNIFTY, etc.).
+4. Registers the 5 SDK callbacks (`trade_callback`, `bidask_callback`,
+   `greek_callback`, `one_min_bar_callback`, `five_min_bar_callback`).
+   Trade + bidask callbacks append to `tick_records`; the others print
+   only.
+5. Starts a daemon thread that auto-saves captured ticks to
+   `tick_data_exports/tick_data_<timestamp>.xlsx` every
+   `AUTO_SAVE_INTERVAL_SECONDS` (default: 30s).
 
-### `.xls` column schema
+### `.xlsx` file locations
 
-Each `.xls` row is one strike × option-type × snapshot-time. The first
-6 columns identify the snapshot + contract; the remaining columns mirror
-the SDK's `chain_columns` (+ `chain_greek_fields` when `greek=true`).
+| Directory                  | Contents                                              |
+|----------------------------|-------------------------------------------------------|
+| `option_chain_exports/`    | One `.xlsx` per chain export, plus `all_chains_*.xlsx` |
+| `tick_data_exports/`       | One `.xlsx` per auto-save tick dump, plus on-demand exports |
 
-**20 base columns** (always present):
+Both directories are in `.gitignore` — they're runtime artifacts, not
+source files.
 
-| # | Column              | Type      | Source |
-|---|---------------------|-----------|--------|
-| 1 | `snapshot_time`     | ISO datetime | Time we sampled the SDK's dataframe (UTC) |
-| 2 | `underlying`        | string    | From the request (e.g. `NIFTY`) |
-| 3 | `expiry`            | YYYY-MM-DD | From the request |
-| 4 | `symbol`            | string    | Full contract symbol (e.g. `NIFTY26073025000CE`) |
-| 5 | `strike`            | string    | Strike price (string because the SDK stores it as a parsed regex group) |
-| 6 | `type`              | string    | `CE` or `PE` |
-| 7 | `ltp`               | float     | Last traded price |
-| 8 | `ltt`               | datetime  | Last traded time |
-| 9 | `ltq`               | int       | Last traded quantity |
-| 10 | `volume`            | int       | Cumulative day volume |
-| 11 | `price_change`      | float     | Absolute change from prev close |
-| 12 | `price_change_perc` | float     | Percentage change from prev close |
-| 13 | `oi`                | int       | Open interest |
-| 14 | `prev_oi`           | int       | Previous day OI |
-| 15 | `oi_change`         | int       | Absolute OI change |
-| 16 | `oi_change_perc`    | float     | Percentage OI change |
-| 17 | `bid`               | float     | Best bid price |
-| 18 | `bid_qty`           | int       | Best bid quantity |
-| 19 | `ask`               | float     | Best ask price |
-| 20 | `ask_qty`           | int       | Best ask quantity |
+### Tick schema (19 columns)
 
-**6 greek columns** (appended when any chain has `greek=true`):
+Captured ticks (from both `trade_callback` and `bidask_callback`) are
+projected onto a flat 19-column schema:
 
-| # | Column  | Type  |
-|---|---------|-------|
-| 21 | `iv`    | float |
-| 22 | `delta` | float |
-| 23 | `theta` | float |
-| 24 | `gamma` | float |
-| 25 | `vega`  | float |
-| 26 | `rho`   | float |
-
-### Response headers
-
-| Header                     | Description                                                |
-|----------------------------|------------------------------------------------------------|
-| `Content-Type`             | `application/zip`                                          |
-| `Content-Disposition`      | `attachment; filename="truedata_option_chain_<userid>_<dur>s.zip"` |
-| `X-Export-Files`           | Comma-separated list of filenames inside the ZIP           |
-| `X-Export-Generated-At`    | ISO timestamp when the ZIP was finalised (UTC)             |
-| `X-Export-Total-Rows`      | Total rows across all `.xls` files (pre-truncation)        |
-| `X-Export-Truncated`       | Comma-separated chains that hit the 60,000-row BIFF8 cap   |
-| `X-Export-Capture-Started` | ISO timestamp when the WS capture window started (UTC)     |
-| `X-Export-Capture-Ended`   | ISO timestamp when the WS capture window ended (UTC)       |
-| `X-Export-Mode`            | Always `option-chain`                                      |
-
-### Error behaviour
-
-| HTTP status | When                                              | Body |
-|-------------|---------------------------------------------------|------|
-| 401         | Missing/invalid Bearer JWT                        | `{"detail": "Not authenticated"}` |
-| 422         | Schema validation failure (empty chains, duplicate pair, out-of-bounds, etc.) | Pydantic error object |
-| 422         | Too many chains (> `TRUEDATA_CHAIN_MAX_PAIRS`)    | Descriptive message |
-| 502         | TrueData SDK error (connect failure, subscription rejected, 0 rows captured) | `TrueData error: <message>` — includes "User Subscription Expired" for trial accounts |
+| # | Column                | Source field(s) |
+|---|-----------------------|-----------------|
+| 1 | `Symbol ID`           | `symbol_id` / `symbolid` / `symbol` |
+| 2 | `Date Time`           | `timestamp` / `date_time` / `time` (falls back to `datetime.now()`) |
+| 3 | `LTP`                 | `ltp` / `last_traded_price` |
+| 4 | `LTQ`                 | `ltq` / `last_traded_qty` |
+| 5 | `ATP`                 | `atp` / `avg_traded_price` |
+| 6 | `TTQ`                 | `ttq` / `volume` / `total_traded_qty` |
+| 7 | `Open`                | `open` / `day_open` |
+| 8 | `High`                | `high` / `day_high` |
+| 9 | `Low`                 | `low` / `day_low` |
+| 10 | `Prev Close`          | `prev_close` / `previous_close` |
+| 11 | `OI`                  | `oi` / `open_interest` |
+| 12 | `Prev Open Int Close` | `prev_oi` / `prev_open_interest` |
+| 13 | `Day's Turnover`      | `turnover` / `day_turnover` |
+| 14 | `Special Tag`         | `special_tag` / `tag` (defaults to `""`) |
+| 15 | `Tick Sequence No`    | `tick_seq` / `tick_sequence_no` / `seq_no` |
+| 16 | `Bid`                 | `bid` / `bid_price` |
+| 17 | `Bid Qty`             | `bid_qty` / `bid_qty1` |
+| 18 | `Ask`                 | `ask` / `ask_price` |
+| 19 | `Ask Qty`             | `ask_qty` / `ask_qty1` |
 
 ### Example (curl)
 
 ```bash
-# 1. Get a JWT (see "Authentication flow" above).
-TOKEN="..."
+# 1. Status check.
+curl http://localhost:8086/
+# => {"status":"running","available_endpoints":["nifty"],"truedata_connected":true,"tick_records_captured":146}
 
-# 2. Capture dual-expiry NIFTY option chains: 30s window, 5s snapshots,
-#    6 strikes per chain (=> 12 contracts per chain, 24 total — well within
-#    the trial's 50-symbol cap, though the trial will still reject the
-#    subscription request itself).
-curl -X POST \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-        "chains": [
-          {"underlying": "NIFTY", "expiry": "2026-07-30", "chain_length": 6},
-          {"underlying": "NIFTY", "expiry": "2026-08-27", "chain_length": 6}
-        ],
-        "duration_seconds": 30,
-        "snapshot_interval_seconds": 5,
-        "segment": "NSE F&O"
-      }' \
-  -o nifty_dual_expiry.zip \
-  -D headers.txt \
-  http://localhost:8000/api/v1/market-data/truedata/option-chain/export
+# 2. Get the current NIFTY option chain as JSON.
+curl http://localhost:8086/option-chain/nifty | jq '.[0]'
+# => {"strike":"23650","type":"CE","ltp":534.0,"ltt":"2026-07-21T13:26:16",
+#     "ltq":65,"volume":6175,"price_change":-100.9,...}
 
-# 3. Inspect the response headers.
-grep "X-Export-" headers.txt
+# 3. Get the last 100 captured ticks.
+curl http://localhost:8086/ticks | jq 'length'
+# => 100
 
-# 4. Unzip and inspect.
-unzip -l nifty_dual_expiry.zip
-unzip -p nifty_dual_expiry.zip metadata.txt
+# 4. Save the NIFTY chain to disk as .xlsx.
+curl http://localhost:8086/export/nifty
+# => {"status":"saved","file":"option_chain_exports/nifty_20260721_075644.xlsx"}
+
+# 5. Save all chains to a single .xlsx (one sheet per chain).
+curl http://localhost:8086/export/all
+# => {"status":"saved","file":"option_chain_exports/all_chains_20260721_075644.xlsx"}
+
+# 6. Save captured ticks to disk as .xlsx.
+curl http://localhost:8086/export/ticks
+# => {"status":"saved","file":"tick_data_exports/tick_data_20260721_075644.xlsx"}
 ```
 
-### Design notes
+### Configuration (env vars)
 
-- **Why v7 `truedata.TD_live` and not v5 `truedata_ws.TD`?** The v5 SDK's
-  option-chain module (`TD_chain.py`) calls `exit()` on any error, which
-  would kill the entire uvicorn process. v7 catches errors gracefully
-  and supports greeks via the `greek_callback` decorator. The two SDKs
-  coexist in `requirements.txt` — tick/historical endpoints use v5,
-  option-chain uses v7.
-- **Why snapshots and not a continuous stream?** The SDK's
-  `OptionChain.update_chain()` runs in a daemon thread that continuously
-  refreshes the chain dataframe from `td.live_data`. We sample that
-  dataframe at the configured cadence rather than emitting every tick,
-  because the team-lead's downstream pipeline works on point-in-time
-  chain state, not on individual tick events.
-- **Why one `.xls` per chain and not one big sheet?** Each chain has a
-  different `(underlying, expiry)` pair, so merging them would require
-  an extra "chain_id" column and make the `.xls` harder to read in
-  Excel. One file per chain matches the tick export's one-file-per-symbol
-  pattern.
+The standalone reads these from `.env` (or real env vars). All have
+sensible defaults matching the reference script.
+
+| Variable                       | Default     | Description                                          |
+|--------------------------------|-------------|------------------------------------------------------|
+| `TRUEDATA_USERNAME`            | `Trial126`  | TrueData login (same as main app)                    |
+| `TRUEDATA_PASSWORD`            | `sand126`   | TrueData password (same as main app)                 |
+| `TRUEDATA_LIVE_PORT`           | `8086`      | TrueData live WS port (same as main app)             |
+| `API_PORT`                     | `8086`      | Port the standalone FastAPI app listens on           |
+| `AUTO_SAVE_INTERVAL_SECONDS`   | `30`        | How often the daemon thread flushes ticks to `.xlsx` |
+
+To change the preset chains or subscribed symbols, edit
+`PRESET_CHAINS` and `MY_SYMBOLS` at the top of
+`app/standalone_truedata.py`. (These are intentionally not env-vars —
+they're code-level config that should be reviewed + committed, not
+tweaked at runtime.)
+
+### Safety
+
+- The SDK's `start_option_chain()` calls builtin `exit()` on failure
+  (e.g. bad symbol/expiry, or trial account "User Subscription Expired").
+  The standalone catches `SystemExit` so the worker doesn't die —
+  failed chains are skipped, the rest still start.
+- All 5 SDK callbacks are wrapped in `try/except` so a malformed tick
+  can't kill the SDK's WS loop.
+- The auto-save thread is `daemon=True` so it dies with the process —
+  no orphan threads on shutdown.
+- Endpoint handlers check `td_obj is None` and return HTTP 503 with a
+  clear message if the SDK isn't initialised (e.g. `truedata` not
+  installed).
 
 ---
 
@@ -588,14 +549,14 @@ unzip -p nifty_dual_expiry.zip metadata.txt
 | `TRUEDATA_REPLAY_PORT`                | `8082`                           | Replay websocket port                    |
 | `TRUEDATA_REPLAY_WINDOW_START_HOUR`   | `18`                             | Replay availability window start (IST, 24h) |
 | `TRUEDATA_REPLAY_WINDOW_END_HOUR`     | `2`                              | Replay availability window end (IST, 24h; crosses midnight) |
-| `TRUEDATA_CHAIN_MAX_DURATION_SEC`     | `300`                            | Max capture window for option-chain export |
-| `TRUEDATA_CHAIN_DEFAULT_DURATION_SEC` | `60`                             | Default capture window for option-chain export |
-| `TRUEDATA_CHAIN_DEFAULT_SNAPSHOT_INTERVAL_SEC` | `5`                      | Default snapshot cadence for option-chain export |
-| `TRUEDATA_CHAIN_MIN_SNAPSHOT_INTERVAL_SEC` | `1`                          | Min snapshot cadence (lower = more rows) |
-| `TRUEDATA_CHAIN_MAX_SNAPSHOT_INTERVAL_SEC` | `60`                         | Max snapshot cadence |
-| `TRUEDATA_CHAIN_MAX_PAIRS`            | `5`                              | Max `(underlying, expiry)` pairs per request |
-| `TRUEDATA_CHAIN_MIN_LENGTH`           | `2`                              | Min strikes per chain |
-| `TRUEDATA_CHAIN_MAX_LENGTH`           | `100`                            | Max strikes per chain |
+
+**Main app** env vars above are loaded by `pydantic-settings` from `.env`.
+**Standalone option-chain app** (see "Standalone TrueData option-chain
+API" section above) reads `TRUEDATA_USERNAME` / `TRUEDATA_PASSWORD` /
+`TRUEDATA_LIVE_PORT` from the same `.env` (via `python-dotenv`), plus
+its own `API_PORT` (default `8086`) and `AUTO_SAVE_INTERVAL_SECONDS`
+(default `30`). The `TRUEDATA_CHAIN_*` settings that previously governed
+the now-removed JWT-protected option-chain endpoint have been deleted.
 
 Override any of them via a `.env` file or real env vars in production.
 
@@ -610,24 +571,30 @@ app/
 │   └── v1/
 │       ├── auth.py              # OTP + register + login routes
 │       ├── users.py             # /users/me
-│       ├── market_data.py       # TrueData historical + tick + replay + option-chain export endpoints
+│       ├── market_data.py       # TrueData historical + tick + replay export endpoints (JWT-protected)
 │       └── router.py            # mounts all v1 routers
 ├── core/
 │   ├── config.py                # Settings (DB, JWT, OTP, TrueData, ticks)
 │   └── database.py              # SQLAlchemy session factory
 ├── models/                      # SQLAlchemy ORM models
 ├── schemas/
-│   ├── market_data.py           # TrueDataExportRequest, TrueDataTickExportRequest, TrueDataOptionChainExportRequest
+│   ├── market_data.py           # TrueDataExportRequest, TrueDataTickExportRequest
 │   ├── otp.py / token.py / user.py
 ├── services/
 │   ├── jwt_service.py           # JWT encode / decode
 │   ├── otp_service.py           # OTP generation / verification
 │   ├── truedata_service.py      # Historical bars SDK wrapper (`truedata-ws`)
 │   ├── truedata_tick_service.py # Live tick SDK wrapper (`truedata-ws` TD class)
-│   ├── truedata_option_chain_service.py # Option-chain SDK wrapper (`truedata` v7 TD_live)
 │   └── excel_export_service.py  # DataFrame → .xls → ZIP
-└── main.py                      # FastAPI app factory
+├── main.py                      # FastAPI app factory (main app, JWT-protected, port 8000)
+└── standalone_truedata.py       # Standalone NO-AUTH app (port 8086) — option chain + tick data
 ```
+
+The main app (`app/main.py`) runs on port 8000 and requires JWT auth
+for all `/market-data/*` endpoints. The standalone app
+(`app/standalone_truedata.py`) runs on port 8086 with NO auth and serves
+option-chain + tick data via long-lived `TD_live` websocket. See the
+"Standalone TrueData option-chain API" section above.
 
 ---
 
@@ -642,7 +609,12 @@ The suite covers:
 - Historical OHLCV export (auth, validation, hard-fail, happy path, symbol normalisation)
 - Live tick export (auth, validation, hard-fail, happy path, default duration, symbol normalisation)
 - Replay tick export (auth, validation, hard-fail, window check, happy path)
-- Option-chain export (auth, validation — empty chains, too many chains, chain_length bounds, duration bounds, duplicate pairs — hard-fail incl. trial's "User Subscription Expired", happy path with dual expiry, greek columns inclusion, underlying upper-casing, service-level edge case)
+
+The option-chain tests (`tests/test_market_data_option_chain.py`) were
+removed along with the JWT-protected POST endpoint they covered. The
+standalone option-chain app (`app/standalone_truedata.py`) is verified
+live against the trial account — see the curl examples in the
+"Standalone TrueData option-chain API" section above.
 
 The TrueData SDK is monkey-patched in tests so they stay hermetic — no live
 network calls. To run an end-to-end live test against the trial account,

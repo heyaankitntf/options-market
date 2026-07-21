@@ -33,6 +33,18 @@ import pandas as pd
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 
+# Load .env from the CWD so the standalone picks up the same TrueData
+# credentials as the main app. pydantic-settings does this for the main
+# app automatically; the standalone uses os.environ directly, so we need
+# to call load_dotenv() ourselves.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:  # pragma: no cover
+    # python-dotenv is a transitive dep of pydantic-settings, so this should
+    # never fire. If it does, env vars still work — .env just isn't loaded.
+    pass
+
 # TrueData is imported lazily so importing this module doesn't crash if the
 # SDK isn't installed yet (e.g. during testing).
 try:
@@ -41,8 +53,10 @@ except ImportError:  # pragma: no cover
     TD_live = None  # type: ignore
 
 # ---------------- Config ----------------
-AUTO_SAVE_INTERVAL_SECONDS = 30  # 300 = 5 minutes. 30 = quick testing.
-API_PORT = 8086
+# All of these can be overridden via env vars (or .env — load_dotenv() above).
+# Defaults match the team-lead's reference script exactly.
+AUTO_SAVE_INTERVAL_SECONDS = int(os.environ.get("AUTO_SAVE_INTERVAL_SECONDS", "30"))
+API_PORT = int(os.environ.get("API_PORT", "8086"))
 
 TRUEDATA_USERNAME = os.environ.get("TRUEDATA_USERNAME", "Trial126")
 TRUEDATA_PASSWORD = os.environ.get("TRUEDATA_PASSWORD", "sand126")

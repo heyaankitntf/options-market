@@ -5,6 +5,7 @@ sqlalchemy>=2.0.0
 python-jose[cryptography]>=3.3.0
 pydantic>=2.0.0
 pydantic-settings>=2.0.0
+python-dotenv>=1.0.0    # used by app/standalone_truedata.py to load .env (main app uses pydantic-settings for the same thing)
 python-multipart>=0.0.9  # required by FastAPI for form/file handling
 
 # TrueData market data + Excel export
