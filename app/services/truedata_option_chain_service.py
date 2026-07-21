@@ -38,6 +38,22 @@ and pulling the additional fields the user requested.
 For the REST API fallback, the response already contains most fields per
 contract (ltp, volume, oi, bid/ask, etc.) so we map them directly.
 
+Duplicate-row suppression (change detection)
+---------------------------------------------
+The snapshot loop polls `chain.get_option_chain()` at a regular cadence
+(every `snapshot_interval_seconds`).  Between two polls a symbol's data
+may not have changed at all — yet without deduplication every snapshot
+would emit a full set of rows for every strike, inflating the .xls by
+10-12× with identical data.
+
+``_SymbolChangeTracker`` implements per-symbol change detection: a row is
+only written when at least one of the **watch fields** (LTP, Bid, Ask, OI,
+Date Time) differs from the previously written row for that symbol.  The
+first snapshot is always emitted (no previous state to compare against).
+
+This keeps the .xls output compact: each row represents a *real* state
+change, not just a polling tick.
+
 Output schema
 -------------
 Call (CE) and Put (PE) data are segregated into **separate .xls files**
@@ -92,6 +108,57 @@ logger = logging.getLogger(__name__)
 class TrueDataError(RuntimeError):
     """Raised when the TrueData SDK fails to connect, subscribe, or capture
     at least one option-chain row. Mapped to HTTP 502 by the route layer."""
+
+
+# --- Per-symbol change detection -----------------------------------------
+# Fields that represent a meaningful data change.  When none of these differ
+# from the previously written value for the same symbol, the row is a
+# duplicate and is silently dropped.
+_CHANGE_DETECT_KEYS: tuple[str, ...] = ("LTP", "Bid", "Ask", "OI", "Date Time")
+
+
+class _SymbolChangeTracker:
+    """Track the last-written field values per symbol so that identical
+    snapshots are suppressed.
+
+    Without this, a 60 s capture at 5 s intervals writes 12 identical rows
+    for every strike that didn't change — inflating the .xls by ~10-12x
+    with no new information.
+
+    Usage::
+
+        tracker = _SymbolChangeTracker()
+        for snapshot in snapshots:
+            for row in rows:
+                if tracker.is_new(row):
+                    output.append(row)
+    """
+
+    def __init__(self) -> None:
+        # symbol_name → tuple of last-seen values for _CHANGE_DETECT_KEYS
+        self._last: dict[str, tuple] = {}
+
+    def is_new(self, row: dict[str, Any]) -> bool:
+        """Return True if this row carries at least one changed field
+        compared to the last row written for the same symbol.
+
+        The symbol is identified by the ``Symbol`` column value.  On the
+        first occurrence the row is always considered new.
+        """
+        symbol: str = str(row.get("Symbol", ""))
+        current = tuple(row.get(k) for k in _CHANGE_DETECT_KEYS)
+
+        prev = self._last.get(symbol)
+        if prev is None:
+            # First time we see this symbol — always write.
+            self._last[symbol] = current
+            return True
+
+        if current != prev:
+            self._last[symbol] = current
+            return True
+
+        return False
 
 
 # --- Output schema -------------------------------------------------------
@@ -732,6 +799,11 @@ def capture_option_chains(
         snapshot_rows[f"{base_key}_CE"] = []
         snapshot_rows[f"{base_key}_PE"] = []
 
+    # Per-symbol change tracker — only emit a row when LTP, Bid, Ask, OI,
+    # or timestamp actually changed since the last write for that symbol.
+    change_tracker = _SymbolChangeTracker()
+    suppressed_count = 0
+
     snapshot_count = 0
     try:
         deadline = time.monotonic() + duration_seconds
@@ -782,6 +854,12 @@ def capture_option_chains(
                         chain_volume=row_data.get("volume"),
                         greek_data=greek_data,
                     )
+
+                    # Only write the row if something meaningful changed.
+                    if not change_tracker.is_new(enriched):
+                        suppressed_count += 1
+                        continue
+
                     # Route CE rows to _CE key, PE rows to _PE key.
                     opt_type = str(row_data.get("type", "")).upper()
                     suffix = "CE" if opt_type == "CE" else "PE"
@@ -811,6 +889,12 @@ def capture_option_chains(
                 logger.warning(
                     "stop_option_chain failed for %s: %s", req.underlying, e
                 )
+
+    if suppressed_count:
+        logger.info(
+            "Change detection suppressed %d duplicate rows during live capture",
+            suppressed_count,
+        )
 
     # Build per-(underlying, expiry) DataFrames from WebSocket data.
     frames: dict[str, pd.DataFrame] = {}
@@ -1068,6 +1152,11 @@ def capture_option_chains_replay(
         snapshot_rows[f"{base_key}_CE"] = []
         snapshot_rows[f"{base_key}_PE"] = []
 
+    # Per-symbol change tracker — only emit a row when LTP, Bid, Ask, OI,
+    # or timestamp actually changed since the last write for that symbol.
+    change_tracker = _SymbolChangeTracker()
+    suppressed_count = 0
+
     snapshot_count = 0
     try:
         deadline = time.monotonic() + duration_seconds
@@ -1116,6 +1205,12 @@ def capture_option_chains_replay(
                         chain_volume=row_data.get("volume"),
                         greek_data=greek_data,
                     )
+
+                    # Only write the row if something meaningful changed.
+                    if not change_tracker.is_new(enriched):
+                        suppressed_count += 1
+                        continue
+
                     opt_type = str(row_data.get("type", "")).upper()
                     suffix = "CE" if opt_type == "CE" else "PE"
                     key = f"{req.underlying}_{expiry_str}_{suffix}"
@@ -1145,6 +1240,12 @@ def capture_option_chains_replay(
                 )
         # Disconnect the replay connection — it's ephemeral, not shared.
         _safe_disconnect(td)
+
+    if suppressed_count:
+        logger.info(
+            "Change detection suppressed %d duplicate rows during replay capture",
+            suppressed_count,
+        )
 
     # Build DataFrames from replay WebSocket data.
     frames: dict[str, pd.DataFrame] = {}
