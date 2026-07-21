@@ -73,29 +73,16 @@ class Settings(BaseSettings):
     TRUEDATA_REPLAY_WINDOW_START_HOUR: int = 18   # 6 PM IST inclusive
     TRUEDATA_REPLAY_WINDOW_END_HOUR: int = 2      # 2 AM IST exclusive (next day)
 
-    # --- TrueData option-chain streaming (live snapshots) ---
-    # Per-request capture duration for the option-chain export endpoint.
-    # The endpoint samples the live option chain at `snapshot_interval_seconds`
-    # cadence for `duration_seconds`, so a 60s/5s request yields ~12 snapshots
-    # per (underlying, expiry) pair. Capped at 300s to avoid HTTP proxy
-    # timeouts (same ceiling as the tick export).
-    TRUEDATA_CHAIN_MAX_DURATION_SEC: int = 300
-    TRUEDATA_CHAIN_DEFAULT_DURATION_SEC: int = 60
-    TRUEDATA_CHAIN_DEFAULT_SNAPSHOT_INTERVAL_SEC: int = 5
-    TRUEDATA_CHAIN_MIN_SNAPSHOT_INTERVAL_SEC: int = 1
-    TRUEDATA_CHAIN_MAX_SNAPSHOT_INTERVAL_SEC: int = 60
-    # Number of (underlying, expiry) pairs a single request can subscribe to.
-    # TrueData trial accounts cap live subscriptions at 50 option contracts
-    # total; with `chain_length=10` (10 strikes × 2 types = 20 contracts
-    # per chain), 2 chains is the safe trial ceiling. We allow up to 5
-    # chains for paid plans with higher subscription caps.
-    TRUEDATA_CHAIN_MAX_PAIRS: int = 5
-    # Strikes either side of ATM per chain. The SDK accepts any even number;
-    # we bound to [2, 100] to keep the .xls readable and stay within trial
-    # subscription caps. `chain_length=10` → 21 strikes × 2 types = 42
-    # contracts per chain (within the trial's 50-symbol cap).
-    TRUEDATA_CHAIN_MIN_LENGTH: int = 2
-    TRUEDATA_CHAIN_MAX_LENGTH: int = 100
+    # --- TrueData option-chain streaming ---
+    # NOTE: The JWT-protected POST /api/v1/market-data/truedata/option-chain/export
+    # endpoint (and the TRUEDATA_CHAIN_* settings that governed it) has been
+    # REMOVED. Option-chain access is now served by the standalone no-auth
+    # FastAPI app in `app/standalone_truedata.py` (port 8086), which uses a
+    # single long-lived TD_live websocket and writes Excel exports directly
+    # to disk. See the "Standalone TrueData option-chain API" section in the
+    # README. The standalone app reads its own config from env vars
+    # (TRUEDATA_USERNAME, TRUEDATA_PASSWORD, TRUEDATA_LIVE_PORT, API_PORT,
+    # AUTO_SAVE_INTERVAL_SECONDS) — see app/standalone_truedata.py.
 
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
