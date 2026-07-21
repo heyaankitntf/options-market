@@ -393,11 +393,17 @@ def export_truedata_option_chain_xls(
     underlying and adjacent weekly expiries to capture both chains in
     a single request.
 
-    IMPORTANT — Account entitlement:
-        TrueData trial accounts do NOT include option-chain entitlement.
-        Calling this endpoint with a trial account returns HTTP 502 with
-        a "User Subscription Expired" message. Upgrade the plan to use
-        this endpoint; no code changes required.
+    IMPORTANT — Account entitlement & dual-mode:
+        This endpoint uses a dual-mode approach:
+          1. First tries the WebSocket live feed (works for NIFTY option chains).
+          2. If WebSocket fails or captures no data, automatically falls back
+             to TrueData's REST API (`getOptionChain` endpoint) which works
+             for stock options like RELIANCE as well.
+
+        Trial accounts: the WebSocket live feed may not stream stock option
+        ticks (RELIANCE, etc.), but the REST API fallback should still work
+        during market hours. No code changes required — the fallback is
+        automatic.
 
     NO AUTHENTICATION REQUIRED — this endpoint is public (no JWT).
     The other `/market-data/*` endpoints still require a Bearer JWT.
