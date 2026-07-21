@@ -52,7 +52,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, time as dt_time
 from typing import Any
 
 import pandas as pd
@@ -358,9 +358,15 @@ def capture_option_chains(
     try:
         for req in requests:
             try:
+                # The TrueData SDK's start_option_chain() internally calls
+                # expiry.date(), so it expects a datetime.datetime, NOT a
+                # datetime.date.  Pydantic parses the JSON "expiry" field as
+                # a bare date — wrap it into a datetime so the SDK doesn't
+                # crash with "'date' object has no attribute 'date'".
+                expiry_dt = datetime.combine(req.expiry, dt_time(15, 30))
                 chain = td.start_option_chain(
                     symbol=req.underlying,
-                    expiry=req.expiry,
+                    expiry=expiry_dt,
                     chain_length=req.chain_length,
                     bid_ask=req.bid_ask,
                     greek=req.greek,
