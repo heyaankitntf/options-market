@@ -412,3 +412,91 @@ def test_capture_option_chains_raises_on_empty_requests():
         truedata_option_chain_service.capture_option_chains(
             [], duration_seconds=30, snapshot_interval_seconds=5,
         )
+
+
+# --- exit() patching (critical safety net) ------------------------------
+
+def test_sdk_exit_patching_prevents_process_death():
+    """The v7 SDK's `start_option_chain` calls builtin `exit()` on failure.
+    Our service patches `exit` in the SDK module namespace so it raises
+    `_SdkExitRaisedError` instead of killing the process. This test verifies
+    that a real (mocked) SDK call that triggers `exit()` is converted to a
+    `TrueDataError` — not a `SystemExit`."""
+    import sys
+    import types
+
+    # Build a fake `truedata.websocket.TD_live` module whose `start_option_chain`
+    # simulates the SDK's failure path by calling `exit()` (just like the real
+    # SDK does on `get_atm` failure).
+    fake_module = types.ModuleType("truedata.websocket.TD_live")
+
+    class _FakeTDLive:
+        def __init__(self, *args, **kwargs):
+            # Real TD_live.__init__ calls self.connect() — fake that too.
+            self.live_data = {}
+            self.greek_data = {}
+
+        def connect(self):
+            pass
+
+        def disconnect(self):
+            pass
+
+        def start_option_chain(self, symbol, expiry, chain_length=None,
+                               bid_ask=False, greek=False):
+            # Simulate the SDK's failure path: `exit()` is called when
+            # `get_atm()` raises. The real SDK code is:
+            #     except Exception as e:
+            #         self.logger.warning(...)
+            #         exit()
+            exit()  # noqa: PLR1722 — intentionally mimics the SDK
+
+    fake_module.TD_live = _FakeTDLive
+    # Capture a reference to the exit_raiser our service installs, so we can
+    # verify it actually got called.
+    captured = {}
+
+    # Replace the real module BEFORE the service tries to import from it.
+    real_module = sys.modules.get("truedata.websocket.TD_live")
+    sys.modules["truedata.websocket.TD_live"] = fake_module
+    try:
+        with pytest.raises(truedata_option_chain_service.TrueDataError) as exc_info:
+            truedata_option_chain_service.capture_option_chains(
+                [ChainRequest(
+                    underlying="NIFTY", expiry=date(2026, 7, 30),
+                    chain_length=10, bid_ask=True, greek=True,
+                )],
+                duration_seconds=5,
+                snapshot_interval_seconds=2,
+            )
+        # Verify the error message mentions the trial-account explanation.
+        assert "option-chain" in str(exc_info.value).lower()
+    finally:
+        if real_module is not None:
+            sys.modules["truedata.websocket.TD_live"] = real_module
+        # Clean up the patch flag so future imports re-patch correctly.
+        if hasattr(fake_module, "_otp_exit_patched"):
+            del fake_module._otp_exit_patched
+
+
+def test_format_subscription_error_mentions_upgrade():
+    """The subscription-error helper mentions both the original error and
+    the upgrade instruction."""
+    msg = truedata_option_chain_service._format_subscription_error(
+        "User Subscription Expired"
+    )
+    assert "User Subscription Expired" in msg
+    assert "Upgrade" in msg
+    assert "option-chain" in msg.lower()
+
+
+def test_sdk_exit_raiser_raises_not_exits():
+    """The `_make_sdk_exit_raiser` returns a callable that raises
+    `_SdkExitRaisedError` rather than calling sys.exit."""
+    raiser = truedata_option_chain_service._make_sdk_exit_raiser()
+    with pytest.raises(truedata_option_chain_service._SdkExitRaisedError):
+        raiser()
+    # With a string argument
+    with pytest.raises(truedata_option_chain_service._SdkExitRaisedError) as exc_info:
+        raiser("boom")
+    assert exc_info.value.original_message == "boom"
