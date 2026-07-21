@@ -345,13 +345,14 @@ def _build_option_chain_metadata_text(
     ]
     for ch in chains:
         key = f"{ch['underlying']}_{ch['expiry']}"
-        rows = rows_per_chain.get(key, 0)
-        flag = "  [TRUNCATED to max rows]" if key in truncated else ""
+        ce_rows = rows_per_chain.get(f"{key}_CE", 0)
+        pe_rows = rows_per_chain.get(f"{key}_PE", 0)
+        flag = "  [TRUNCATED]" if f"{key}_CE" in truncated or f"{key}_PE" in truncated else ""
         greek_tag = " greek=on" if ch.get("greek") else ""
         bidask_tag = " bidask=off" if not ch.get("bid_ask", True) else ""
         lines.append(
             f"  - {ch['underlying']:<12} {ch['expiry']}  len={ch['chain_length']:<3}"
-            f"  {rows:>8} rows{greek_tag}{bidask_tag}{flag}"
+            f"  CE={ce_rows:>6}  PE={pe_rows:>6} rows{greek_tag}{bidask_tag}{flag}"
         )
     lines.extend([
         "",
@@ -366,9 +367,11 @@ def _build_option_chain_metadata_text(
         "  Underlying, Expiry, Strike, Type",
         "  [+ IV, Delta, Theta, Gamma, Vega, Rho]  (only when greek=true)",
         "",
-        "NOTE: Each row is one strike x option-type x snapshot-time. The SDK "
-        "updates the chain in real-time; we snapshot its current state at "
-        "the configured cadence.",
+        "FILE STRUCTURE: Call (CE) and Put (PE) data are in SEPARATE .xls files.",
+        "Each (underlying, expiry) pair produces two files: *_CE.xls and *_PE.xls.",
+        "",
+        "NOTE: Each row is one strike x snapshot-time. The SDK updates the chain "
+        "in real-time; we snapshot its current state at the configured cadence.",
         "",
         "TRIAL ACCOUNT CAVEAT: TrueData trial accounts get 'User Subscription "
         "Expired' on option-chain subscriptions. Upgrade the plan to use this "

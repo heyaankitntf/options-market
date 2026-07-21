@@ -319,6 +319,9 @@ class TrueDataOptionChainExportRequest(BaseModel):
     Plus 6 optional greek columns (IV, Delta, Theta, Gamma, Vega, Rho)
     when any chain requests greeks.
 
+    Call (CE) and Put (PE) data are written to SEPARATE .xls files:
+    each (underlying, expiry) pair produces `*_CE.xls` and `*_PE.xls`.
+
     IMPORTANT — Account entitlement:
         Trial accounts get 'User Subscription Expired' on the option-chain
         subscription request. The endpoint will work the moment the
