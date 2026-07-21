@@ -79,10 +79,18 @@ model RawSnapshot {
   portalSession String?
   status       String   @default("captured") // captured | failed
   durationMs   Int      @default(0)
+  // Provenance tag — distinguishes real market data from any synthetic
+  // data that may have been written by tests or dev scripts. New rows
+  // written by production code paths MUST set this to 'live'. Allowed
+  // values: live | mock | replay | unknown. Default 'unknown' so legacy
+  // rows (created before this column existed) are explicitly NOT
+  // trusted as real.
+  source       String   @default("unknown")
   profile      Profile  @relation(fields: [profileId], references: [id], onDelete: Cascade)
 
   @@index([profileId, fetchedAt])
   @@index([symbol])
+  @@index([source])
 }
 
 // ---------------------------------------------------------------------------
@@ -116,11 +124,16 @@ model Report {
   indicatorsJson  String   // JSON: strikes table + extra metrics
   summaryJson     String   // JSON: AI/Rule summary text blocks
   reportHash      String
+  // Provenance tag — see RawSnapshot.source for semantics. A report's
+  // source MUST match the source of the RawSnapshot it was generated
+  // from. Default 'unknown' for legacy rows.
+  source          String   @default("unknown")
   profile         Profile  @relation(fields: [profileId], references: [id], onDelete: Cascade)
 
   @@index([profileId, generatedAt])
   @@index([symbol, generatedAt])
   @@index([generatedAt])
+  @@index([source])
 }
 
 // ---------------------------------------------------------------------------

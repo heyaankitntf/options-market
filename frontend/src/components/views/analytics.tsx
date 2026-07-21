@@ -11,7 +11,7 @@ import {
   Gauge, BarChart3, Zap, ArrowUpDown,
 } from 'lucide-react'
 import { api, type HistoryResponse, type SymbolAnalytics } from '@/lib/api'
-import { SYMBOL_SPECS } from '@/lib/mock-market'
+import { SYMBOL_SPECS } from '@/lib/symbols'
 import { fmtNum, fmtOI, fmtSigned, relTime, fmtDateTime } from '@/lib/format'
 import { SectionHeader, TrendBadge, EmptyState, StatCard } from '@/components/ui/primitives'
 import { Card } from '@/components/ui/card'

@@ -23,36 +23,43 @@ bun run dev
 ```
 The app starts on **http://localhost:3000**. Open it in your browser.
 
-### 3. (First run) Seed the database
-On first launch, the database is auto-seeded with 5 demo profiles (Nifty, Bank Nifty,
-Sensex, FinNifty, Midcap Nifty), a default formula template, notification channels,
-and an admin user.
+### 3. (First run) Database setup
+The app no longer auto-seeds demo data — that would have written `admin@optflow.io` /
+`admin123` and demo icharts credentials into your deployment, which is unsafe and
+makes it impossible to tell real data from test data.
 
-To re-seed manually:
-```bash
-bun run src/lib/seed.ts
-```
+Instead, on first launch:
+1. Open the **Administration → Users** tab and create a real admin user with a
+   strong password.
+2. Open **Administration → Credentials** and add your real icharts portal login
+   (stored encrypted with AES-256-GCM).
+3. Open **Profiles** and create the automation profiles you actually need.
+4. (Optional) Open **Administration → Formula Templates** to tune the analytics
+   thresholds.
 
 ### 4. Configure credentials
-Real credentials (Telegram bot + icharts portal) are configured via:
-```bash
-bun run src/lib/setup-credentials.ts
-```
-This sets up:
-- **Telegram bot** (`@quant_options_bot`) → sends reports to the `@quant_opt` group
-- **icharts portal** login (encrypted at rest with AES-256-GCM)
+Real credentials (Telegram bot + icharts portal) are managed via the
+**Administration** tab in the UI — never hardcoded in the repo. Hardcoded
+secrets (e.g. the old `setup-credentials.ts` script with a plaintext Telegram
+bot token) have been removed; rotate any credentials that may have been
+committed historically.
 
-You can also manage credentials from the **Administration** tab in the UI.
-
-### 5. Start the scraper mini-service (optional, for real scraping)
-The main app uses a high-fidelity mock data generator by default. To use real
-icharts scraping via Playwright:
+### 5. Start the scraper mini-service (for real icharts scraping)
+The scheduler refuses to run without a real data source — it will NOT silently
+fall back to mock data. To enable real icharts scraping via Playwright:
 ```bash
 cd mini-services/scraper-service
 bun install
 bunx playwright install chromium   # one-time browser install
 bun run dev                         # starts on port 3030
 ```
+If Playwright is not installed, `/scrape` returns HTTP 503 with a clear error
+message rather than serving synthetic data.
+
+The in-process scheduler (`src/lib/scheduler.ts`) also exposes a single
+`captureLiveOptionChain()` function that must be wired to your real data source
+(TrueData backend, scraper-service, etc.). Until this is wired, profile runs
+fail with a clear error instead of producing fake data.
 
 ## Features
 
@@ -93,12 +100,12 @@ bun run dev                         # starts on port 3030
 ### Telegram Bot Setup
 1. Create a bot via [@BotFather](https://t.me/BotFather) → get the API token
 2. Add the bot to your Telegram group as an admin (so it can send messages)
-3. Run `bun run src/lib/setup-credentials.ts` (edit the token/chatId first)
-4. Or configure via the **Notifications** tab in the UI
+3. Configure the bot token + chat ID via the **Notifications** tab in the UI
+   (stored encrypted in the database; never committed to the repo)
 
 ### icharts Portal Credentials
 - Stored encrypted (AES-256-GCM) in the database
-- Configure via `setup-credentials.ts` or the **Administration → Credentials** tab
+- Configure via the **Administration → Credentials** tab in the UI
 
 ### System Settings
 Editable via **Administration → System Settings**:
@@ -126,11 +133,12 @@ src/
 │   └── views/          # Dashboard, Analytics, Reports, etc.
 ├── lib/
 │   ├── analytics.ts    # PCR, Max Pain, IV, trend engine
-│   ├── scheduler.ts    # Automation pipeline
+│   ├── scheduler.ts    # Automation pipeline (live data only — no mock fallback)
 │   ├── notify.ts       # Telegram/email/webhook dispatcher
 │   ├── crypto.ts       # AES-256-GCM encryption
 │   ├── export.ts       # CSV/JSON/XLSX/PDF
-│   ├── mock-market.ts  # Synthetic option-chain generator
+│   ├── symbols.ts      # Reference data: tradable indices, strike steps, expiry calc
+│   ├── mock-market.ts  # TEST ONLY — synthetic option-chain generator (not wired to prod)
 │   └── db.ts           # Prisma client
 └── prisma/schema.prisma
 mini-services/scraper-service/   # Playwright scraper (port 3030)
