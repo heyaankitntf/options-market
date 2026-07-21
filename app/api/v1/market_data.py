@@ -469,6 +469,7 @@ def export_truedata_option_chain_xls(
         capture_started_at=result.capture_started_at,
         capture_ended_at=result.capture_ended_at,
         total_rows=result.total_rows,
+        messages_log=result.messages_log,
     )
 
     files = excel_export_service.list_files(zip_bytes)

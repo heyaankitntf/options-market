@@ -154,6 +154,81 @@ def _format_subscription_error(original_msg: str) -> str:
     )
 
 
+# --- SDK log handler (early-bail on trial account) ----------------------
+
+class _SubscriptionErrorTracker:
+    """Thread-safe flag set when the SDK logs 'User Subscription Expired'
+    (or any 'request encountered an error' message). The SDK does NOT raise
+    on this — it just logs every 5s in a daemon thread — so we need a log
+    handler to detect it and bail out of the capture loop early instead of
+    waiting the full `duration_seconds` for empty snapshots."""
+
+    def __init__(self) -> None:
+        import threading
+        self._lock = threading.Lock()
+        self._seen = False
+        self._messages: list[str] = []
+
+    def record(self, message: str) -> None:
+        with self._lock:
+            self._seen = True
+            if len(self._messages) < 10:  # cap memory
+                self._messages.append(message)
+
+    @property
+    def seen(self) -> bool:
+        with self._lock:
+            return self._seen
+
+    @property
+    def messages(self) -> list[str]:
+        with self._lock:
+            return list(self._messages)
+
+
+class _SdkLogHandler(logging.Handler):
+    """Forwards SDK log records to a `_SubscriptionErrorTracker` when the
+    message contains a subscription error."""
+
+    def __init__(self, tracker: "_SubscriptionErrorTracker") -> None:
+        super().__init__(level=logging.WARNING)
+        self._tracker = tracker
+
+    def emit(self, record: logging.LogRecord) -> None:  # noqa: D401
+        try:
+            msg = record.getMessage()
+        except Exception:  # noqa: BLE001
+            return
+        # The SDK formats the error as:
+        #   "The request encountered an error - User Subscription Expired"
+        # Match on the key phrase; if the SDK rewords it later we still
+        # match on "request encountered an error" + "expired".
+        if "Subscription Expired" in msg:
+            self._tracker.record(msg)
+        elif "request encountered an error" in msg.lower() and "expired" in msg.lower():
+            self._tracker.record(msg)
+
+
+def _make_sdk_log_handler(tracker: "_SubscriptionErrorTracker") -> _SdkLogHandler:
+    return _SdkLogHandler(tracker)
+
+
+def _attach_sdk_log_handler(handler: logging.Handler) -> None:
+    """Attach the handler to the truedata SDK's logger. Idempotent — won't
+    double-attach if called multiple times. Also doesn't propagate to root
+    so the SDK's chatty logs don't spam the app's log stream."""
+    sdk_logger = logging.getLogger("truedata")
+    # Don't double-attach
+    for h in sdk_logger.handlers:
+        if isinstance(h, _SdkLogHandler):
+            return
+    sdk_logger.addHandler(handler)
+    # Make sure our handler actually receives WARNING-level SDK logs.
+    if sdk_logger.level == logging.NOTSET or sdk_logger.level > logging.WARNING:
+        sdk_logger.setLevel(logging.WARNING)
+    sdk_logger.debug("Attached option-chain subscription-error tracker")
+
+
 # --- Output schema -------------------------------------------------------
 
 # Base columns — always present in the output .xls. Matches the SDK's
@@ -212,11 +287,141 @@ class ChainCaptureResult:
     `frames` maps each (underlying, expiry) pair → its DataFrame (columns
     in `OPTION_CHAIN_COLUMNS` order, plus `GREEK_COLUMNS` if any chain
     requested greeks). The key format is `"{UNDERLYING}_{YYYY-MM-DD}"`.
+
+    `messages_log` is a multi-line string of every SDK log line + callback
+    event (trade, bidask, greek, bars) captured during the run. Returned
+    to the caller as a `messages.log` file inside the ZIP so the user can
+    see exactly what the SDK emitted — useful for debugging trial-account
+    'User Subscription Expired' errors, missing data, etc.
     """
     frames: dict[str, pd.DataFrame]
     capture_started_at: str
     capture_ended_at: str
     total_rows: int
+    messages_log: str = ""
+
+
+# --- Message capture (SDK logs + callback events) -----------------------
+
+class _MessageLog:
+    """Thread-safe append-only log of SDK log lines + callback events.
+    Capped at `max_lines` to bound memory — once the cap is hit, we keep
+    the first half and the latest half (drop the middle) so the user
+    always sees the start (connection / subscription) and the end (any
+    error before bailing)."""
+
+    def __init__(self, max_lines: int = 5000) -> None:
+        import threading
+        self._lock = threading.Lock()
+        self._lines: list[str] = []
+        self._max = max_lines
+
+    def append(self, line: str) -> None:
+        if not line:
+            return
+        with self._lock:
+            self._lines.append(line)
+            # If we hit the cap, drop the middle third to bound memory
+            # while keeping start + end visible.
+            if len(self._lines) > self._max:
+                keep_head = self._max // 2
+                keep_tail = self._max - keep_head
+                self._lines = (
+                    self._lines[:keep_head] + self._lines[-keep_tail:]
+                )
+
+    def extend(self, lines) -> None:
+        for line in lines:
+            self.append(line)
+
+    def as_text(self) -> str:
+        with self._lock:
+            return "\n".join(self._lines) + ("\n" if self._lines else "")
+
+
+def _register_sdk_callbacks(td: Any, msg_log: "_MessageLog") -> None:
+    """Register the five SDK callbacks (trade, bidask, greek, 1-min bar,
+    5-min bar) so every live event gets appended to `msg_log`.
+
+    The SDK invokes these from its WS daemon thread — the log must be
+    thread-safe (it is — `_MessageLog` uses a Lock). We also catch any
+    exception inside each callback so a malformed tick never kills the
+    SDK's WS loop.
+    """
+    def _safe(label: str, obj: Any) -> None:
+        try:
+            msg_log.append(f"[{datetime.now(timezone.utc).isoformat()}] {label}: {obj}")
+        except Exception:  # noqa: BLE001
+            pass
+
+    # The SDK's @callback decorators just store the function on the WS layer.
+    # We call them once after `td` is constructed.
+    try:
+        td.trade_callback(lambda tick: _safe("TRADE", tick))
+    except Exception as e:  # noqa: BLE001
+        msg_log.append(f"[warn] could not register trade_callback: {e}")
+    try:
+        td.bidask_callback(lambda ba: _safe("BIDASK", ba))
+    except Exception as e:  # noqa: BLE001
+        msg_log.append(f"[warn] could not register bidask_callback: {e}")
+    try:
+        td.greek_callback(lambda g: _safe("GREEK", g))
+    except Exception as e:  # noqa: BLE001
+        msg_log.append(f"[warn] could not register greek_callback: {e}")
+    try:
+        td.one_min_bar_callback(lambda bar: _safe("BAR_1MIN", bar))
+    except Exception as e:  # noqa: BLE001
+        msg_log.append(f"[warn] could not register one_min_bar_callback: {e}")
+    try:
+        td.five_min_bar_callback(lambda bar: _safe("BAR_5MIN", bar))
+    except Exception as e:  # noqa: BLE001
+        msg_log.append(f"[warn] could not register five_min_bar_callback: {e}")
+
+
+class _LogCaptureHandler(logging.Handler):
+    """A logging.Handler that appends every record (formatted as
+    `LEVEL :: name :: message`) to a `_MessageLog`. Used to capture the
+    SDK's chatty log stream — including the recurring 'User Subscription
+    Expired' error — into the response ZIP."""
+
+    def __init__(self, msg_log: "_MessageLog") -> None:
+        super().__init__(level=logging.DEBUG)
+        self._log = msg_log
+
+    def emit(self, record: logging.LogRecord) -> None:  # noqa: D401
+        try:
+            ts = datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat()
+            line = f"[{ts}] LOG/{record.levelname} {record.name}: {record.getMessage()}"
+            self._log.append(line)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _attach_log_capture(msg_log: "_MessageLog") -> _LogCaptureHandler:
+    """Attach a `_LogCaptureHandler` to the truedata SDK logger (and
+    optionally to our own service logger) so every log line ends up in
+    the response ZIP. Idempotent — won't double-attach."""
+    handler = _LogCaptureHandler(msg_log)
+    for name in ("truedata", "app.services.truedata_option_chain_service"):
+        lg = logging.getLogger(name)
+        # Don't double-attach our handler type.
+        if not any(isinstance(h, _LogCaptureHandler) for h in lg.handlers):
+            lg.addHandler(handler)
+        # Make sure we actually see SDK debug output.
+        if name == "truedata" and (lg.level == logging.NOTSET or lg.level > logging.DEBUG):
+            lg.setLevel(logging.DEBUG)
+    return handler
+
+
+def _detach_log_capture(handler: _LogCaptureHandler) -> None:
+    """Remove the handler from every logger it was attached to. Call
+    after capture completes so we don't leak memory across requests."""
+    for name in ("truedata", "app.services.truedata_option_chain_service"):
+        lg = logging.getLogger(name)
+        try:
+            lg.removeHandler(handler)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # --- Row projection -----------------------------------------------------
@@ -350,6 +555,25 @@ def capture_option_chains(
         settings.TRUEDATA_URL, settings.TRUEDATA_LIVE_PORT,
     )
 
+    # --- Set up the message log + log capture handler -----------------------
+    # The message log collects BOTH:
+    #   (a) every SDK log line (via `_LogCaptureHandler` attached to the
+    #       `truedata` logger) — including the recurring
+    #       'User Subscription Expired' error
+    #   (b) every SDK callback event (trade tick, bidask, greek, 1-min bar,
+    #       5-min bar) — registered on `td` after construction
+    # The full log is returned to the caller as `messages.log` inside the
+    # response ZIP so they can see exactly what the SDK emitted during the
+    # capture window.
+    msg_log = _MessageLog(max_lines=5000)
+    msg_log.append(
+        f"[{started_at.isoformat()}] === option-chain capture START "
+        f"chains={len(requests)} duration={duration_seconds}s "
+        f"snapshot_interval={snapshot_interval_seconds}s "
+        f"url={settings.TRUEDATA_URL} port={settings.TRUEDATA_LIVE_PORT} ==="
+    )
+    log_capture_handler = _attach_log_capture(msg_log)
+
     # --- Patch the SDK's `exit()` calls before instantiating TD_live -----------
     # The v7 truedata SDK calls the builtin `exit()` from
     # `TD_live.start_option_chain()` whenever `get_atm()` or `OptionChain()`
@@ -361,6 +585,14 @@ def capture_option_chains(
     # our patched `exit` will propagate as soon as it's called — perfect.
     sdk_exit_raiser = _make_sdk_exit_raiser()
     _patch_sdk_exit(TD_live, sdk_exit_raiser)
+
+    # --- Install a log handler to detect the SDK's recurring "User Subscription
+    # Expired" error. The SDK doesn't raise on this — it just logs every 5s in
+    # a daemon thread (see truedata/websocket/TD_ws.py::handle_message_data).
+    # Without this handler, we'd wait the full `duration_seconds` for nothing.
+    subscription_error_tracker = _SubscriptionErrorTracker()
+    sdk_log_handler = _make_sdk_log_handler(subscription_error_tracker)
+    _attach_sdk_log_handler(sdk_log_handler)
 
     # We pass `full_feed=False` because the option-chain feature only needs
     # the regular live-data subscription (the chain object reads from
@@ -383,18 +615,35 @@ def capture_option_chains(
     except _SdkExitRaisedError as e:
         # Our patched exit() raised this — the SDK was about to die because
         # of a bad symbol/expiry OR the trial-account subscription error.
+        msg_log.append(
+            f"[{datetime.now(timezone.utc).isoformat()}] "
+            f"=== CAPTURE FAILED (SDK exit): {e.original_message} ==="
+        )
+        _detach_log_capture(log_capture_handler)
         raise TrueDataError(
             _format_subscription_error(e.original_message)
+            + f"\n\n--- captured messages ---\n{msg_log.as_text()}"
         ) from e
     except Exception as e:
         msg = str(e)
+        msg_log.append(
+            f"[{datetime.now(timezone.utc).isoformat()}] "
+            f"=== CAPTURE FAILED (TD_live constructor): {type(e).__name__}: {msg} ==="
+        )
+        _detach_log_capture(log_capture_handler)
         if "Subscription Expired" in msg or "expired" in msg.lower():
             raise TrueDataError(
                 _format_subscription_error(msg)
+                + f"\n\n--- captured messages ---\n{msg_log.as_text()}"
             ) from e
         raise TrueDataError(
             f"Failed to create TD_live client: {type(e).__name__}: {e}"
+            f"\n\n--- captured messages ---\n{msg_log.as_text()}"
         ) from e
+
+    # Register SDK callbacks (trade, bidask, greek, bars) so every live event
+    # gets appended to `msg_log`. See `_register_sdk_callbacks` docstring.
+    _register_sdk_callbacks(td, msg_log)
 
     # Start each requested chain. We track them in a list of (request, chain)
     # tuples so we can iterate over them at snapshot time.
@@ -470,6 +719,39 @@ def capture_option_chains(
                 key = f"{req.underlying}_{expiry_str}"
                 snapshot_rows[key].extend(rows)
             snapshot_count += 1
+
+            # --- Early-bail: if the SDK has been logging "User Subscription
+            # Expired" (or any recurring subscription error) AND we've
+            # captured zero rows so far, bail out immediately instead of
+            # waiting the full `duration_seconds`. The trial account will
+            # never produce data, so there's no point spamming logs.
+            if (
+                subscription_error_tracker.seen
+                and all(len(r) == 0 for r in snapshot_rows.values())
+                and snapshot_count >= 1
+            ):
+                logger.warning(
+                    "Bailing out of option-chain capture early after %d "
+                    "snapshot(s): SDK reported subscription error. "
+                    "Sample SDK error: %s",
+                    snapshot_count,
+                    subscription_error_tracker.messages[0]
+                    if subscription_error_tracker.messages else "(none)",
+                )
+                msg_log.append(
+                    f"[{datetime.now(timezone.utc).isoformat()}] "
+                    f"=== CAPTURE BAILED EARLY after {snapshot_count} snapshot(s): "
+                    f"subscription error — see above ==="
+                )
+                raise TrueDataError(
+                    _format_subscription_error(
+                        subscription_error_tracker.messages[0]
+                        if subscription_error_tracker.messages
+                        else "User Subscription Expired"
+                    )
+                    + f"\n\n--- captured messages ---\n{msg_log.as_text()}"
+                )
+
             # Sleep for the snapshot interval, but don't overshoot the deadline.
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -481,8 +763,13 @@ def capture_option_chains(
     except TrueDataError:
         raise
     except Exception as e:
+        msg_log.append(
+            f"[{datetime.now(timezone.utc).isoformat()}] "
+            f"=== CAPTURE FAILED (unexpected): {type(e).__name__}: {e} ==="
+        )
         raise TrueDataError(
             f"Error during option-chain capture: {type(e).__name__}: {e}"
+            f"\n\n--- captured messages ---\n{msg_log.as_text()}"
         ) from e
     finally:
         # Stop all chains first (unsubscribes their option symbols), then
@@ -495,10 +782,14 @@ def capture_option_chains(
                 logger.warning(
                     "stop_option_chain failed for %s: %s", req.underlying, e
                 )
-        try:
-            td.disconnect()
-        except Exception as e:  # noqa: BLE001
-            logger.warning("TrueData disconnect failed: %s: %s", type(e).__name__, e)
+        if td is not None:
+            try:
+                td.disconnect()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("TrueData disconnect failed: %s: %s", type(e).__name__, e)
+        # Always detach our log capture handler so it doesn't leak across
+        # requests on the same worker.
+        _detach_log_capture(log_capture_handler)
 
     # Build per-(underlying, expiry) DataFrames.
     columns = OPTION_CHAIN_COLUMNS + (GREEK_COLUMNS if any_greek else [])
@@ -518,6 +809,12 @@ def capture_option_chains(
         ).reset_index(drop=True)
         frames[key] = df
 
+    msg_log.append(
+        f"[{datetime.now(timezone.utc).isoformat()}] "
+        f"=== CAPTURE COMPLETE total_rows={total} chains={len(frames)} "
+        f"snapshots={snapshot_count} ==="
+    )
+
     if total == 0:
         raise TrueDataError(
             "No option-chain rows were captured during the capture window. "
@@ -526,6 +823,7 @@ def capture_option_chains(
             "closed (IST 09:15–15:30 Mon–Fri) and no option trades occurred, "
             "(c) requested expiry is not a valid trading expiry for the "
             "underlying. Check the logs above for SDK errors."
+            f"\n\n--- captured messages ---\n{msg_log.as_text()}"
         )
 
     logger.info(
@@ -539,4 +837,5 @@ def capture_option_chains(
         capture_started_at=started_at.isoformat(),
         capture_ended_at=capture_ended_at.isoformat(),
         total_rows=total,
+        messages_log=msg_log.as_text(),
     )

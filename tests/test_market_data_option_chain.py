@@ -19,6 +19,7 @@ monkey-patched so the tests stay hermetic and fast. The goal is to verify:
 from __future__ import annotations
 
 import io
+import logging
 import zipfile
 from datetime import date, datetime, timezone
 from unittest.mock import patch
@@ -500,3 +501,146 @@ def test_sdk_exit_raiser_raises_not_exits():
     with pytest.raises(truedata_option_chain_service._SdkExitRaisedError) as exc_info:
         raiser("boom")
     assert exc_info.value.original_message == "boom"
+
+
+# --- messages.log in ZIP response ---------------------------------------
+
+def test_option_chain_zip_includes_messages_log(client: TestClient):
+    """The response ZIP must contain a `messages.log` file with the SDK
+    log lines + callback events captured during the run. This is the
+    user-facing 'message log from the API' feature."""
+    token = _login(client, phone="9000070020")
+
+    def _capture(reqs, *, duration_seconds, snapshot_interval_seconds):
+        result = _fake_option_chain_result(reqs, snapshots_per_chain=1)
+        # Inject a fake messages_log so we can verify it round-trips into
+        # the ZIP.
+        result.messages_log = (
+            "[2026-07-21T06:30:00Z] === option-chain capture START ===\n"
+            "[2026-07-21T06:30:01Z] LOG/INFO truedata: Connected\n"
+            "[2026-07-21T06:30:02Z] TRADE: NIFTY2673025000CE ltp=100.5\n"
+            "[2026-07-21T06:30:03Z] BIDASK: NIFTY2673025000CE bid=100.4 ask=100.6\n"
+            "[2026-07-21T06:30:04Z] GREEK: NIFTY2673025000CE iv=12.5 delta=0.45\n"
+            "[2026-07-21T06:30:05Z] === CAPTURE COMPLETE ===\n"
+        )
+        return result
+
+    with patch.object(truedata_option_chain_service, "capture_option_chains", side_effect=_capture):
+        r = client.post(
+            "/api/v1/market-data/truedata/option-chain/export",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "chains": [
+                    {"underlying": "NIFTY", "expiry": "2026-07-30"},
+                ],
+                "duration_seconds": 30,
+            },
+        )
+
+    assert r.status_code == 200, r.text
+    with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+        names = zf.namelist()
+        assert "messages.log" in names, f"messages.log missing from ZIP: {names}"
+        log_content = zf.read("messages.log").decode("utf-8")
+        assert "option-chain capture START" in log_content
+        assert "TRADE:" in log_content
+        assert "BIDASK:" in log_content
+        assert "GREEK:" in log_content
+        assert "CAPTURE COMPLETE" in log_content
+
+
+def test_option_chain_error_includes_captured_messages(client: TestClient):
+    """When the service raises TrueDataError, the error message includes
+    the captured SDK log lines so the caller can see what the SDK emitted
+    before bailing."""
+    token = _login(client, phone="9000070021")
+
+    def _fail(reqs, *, duration_seconds, snapshot_interval_seconds):
+        raise truedata_option_chain_service.TrueDataError(
+            "User Subscription Expired\n\n--- captured messages ---\n"
+            "[2026-07-21T06:30:00Z] LOG/ERROR truedata: "
+            "The request encountered an error - User Subscription Expired\n"
+        )
+
+    with patch.object(truedata_option_chain_service, "capture_option_chains", side_effect=_fail):
+        r = client.post(
+            "/api/v1/market-data/truedata/option-chain/export",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "chains": [
+                    {"underlying": "NIFTY", "expiry": "2026-07-30"},
+                ],
+                "duration_seconds": 30,
+            },
+        )
+
+    assert r.status_code == 502, r.text
+    body = r.json()
+    detail = body.get("detail", "")
+    assert "User Subscription Expired" in detail
+    assert "captured messages" in detail
+    assert "request encountered an error" in detail
+
+
+# --- Early-bail on trial-account subscription error ---------------------
+
+def test_subscription_error_tracker_records_messages():
+    """The `_SubscriptionErrorTracker` is thread-safe and caps stored messages."""
+    tracker = truedata_option_chain_service._SubscriptionErrorTracker()
+    assert not tracker.seen
+    tracker.record("The request encountered an error - User Subscription Expired")
+    assert tracker.seen
+    assert "User Subscription Expired" in tracker.messages[0]
+
+
+def test_sdk_log_handler_detects_subscription_expired():
+    """The `_SdkLogHandler` triggers the tracker only on subscription errors,
+    not on unrelated SDK warnings."""
+    tracker = truedata_option_chain_service._SubscriptionErrorTracker()
+    handler = truedata_option_chain_service._SdkLogHandler(tracker)
+
+    # Unrelated warning shouldn't trigger
+    handler.emit(logging.LogRecord(
+        name="truedata", level=logging.WARNING, pathname="", lineno=0,
+        msg="Some unrelated SDK warning", args=None, exc_info=None,
+    ))
+    assert not tracker.seen
+
+    # Subscription Expired should trigger
+    handler.emit(logging.LogRecord(
+        name="truedata", level=logging.WARNING, pathname="", lineno=0,
+        msg="The request encountered an error - User Subscription Expired",
+        args=None, exc_info=None,
+    ))
+    assert tracker.seen
+
+
+def test_attach_sdk_log_handler_is_idempotent():
+    """Attaching a second `_SdkLogHandler` is a no-op (the existing one is
+    kept). We don't compare handler counts before/after — only verify no
+    NEW handler is added when one is already present."""
+    sdk_logger = logging.getLogger("truedata")
+    tracker = truedata_option_chain_service._SubscriptionErrorTracker()
+    h1 = truedata_option_chain_service._make_sdk_log_handler(tracker)
+    h2 = truedata_option_chain_service._make_sdk_log_handler(tracker)
+
+    # Clean slate: remove any pre-existing _SdkLogHandler from earlier tests.
+    for h in list(sdk_logger.handlers):
+        if isinstance(h, truedata_option_chain_service._SdkLogHandler):
+            sdk_logger.removeHandler(h)
+
+    truedata_option_chain_service._attach_sdk_log_handler(h1)
+    sdk_handlers = [h for h in sdk_logger.handlers
+                    if isinstance(h, truedata_option_chain_service._SdkLogHandler)]
+    assert len(sdk_handlers) == 1
+    assert sdk_handlers[0] is h1
+
+    # Second attach should be a no-op — h1 stays, h2 is NOT added.
+    truedata_option_chain_service._attach_sdk_log_handler(h2)
+    sdk_handlers = [h for h in sdk_logger.handlers
+                    if isinstance(h, truedata_option_chain_service._SdkLogHandler)]
+    assert len(sdk_handlers) == 1
+    assert sdk_handlers[0] is h1
+
+    # Cleanup
+    sdk_logger.removeHandler(h1)

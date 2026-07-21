@@ -378,6 +378,7 @@ def build_option_chain_zip(
     capture_started_at: str,
     capture_ended_at: str,
     total_rows: int,
+    messages_log: str = "",
 ) -> tuple[bytes, dict[str, int], list[str]]:
     """Bundle per-(underlying, expiry) option-chain DataFrames into a ZIP.
 
@@ -385,6 +386,12 @@ def build_option_chain_zip(
     .xls files use the canonical option-chain column order (matches the
     spec the API provider shared with the team — see
     `OPTION_CHAIN_COLUMNS` in `truedata_option_chain_service.py`).
+
+    If `messages_log` is non-empty, it is written as a `messages.log` file
+    inside the ZIP — this contains every SDK log line + callback event
+    (trade ticks, bidask, greeks, bars) captured during the run, so the
+    user can see exactly what the SDK emitted. Especially useful for
+    debugging trial-account 'User Subscription Expired' errors.
     """
     buf = io.BytesIO()
     rows_per_chain: dict[str, int] = {}
@@ -425,5 +432,17 @@ def build_option_chain_zip(
             total_rows=total_rows,
         )
         zf.writestr("metadata.txt", meta)
+
+        # Include the SDK message log so the caller can see every log line +
+        # callback event captured during the run. Even when empty we still
+        # write the file (with a single header line) so downstream tooling
+        # can rely on the file always being present.
+        if messages_log:
+            zf.writestr("messages.log", messages_log)
+        else:
+            zf.writestr(
+                "messages.log",
+                "(no SDK messages were captured during this run)\n",
+            )
 
     return buf.getvalue(), rows_per_chain, truncated
