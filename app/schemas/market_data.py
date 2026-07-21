@@ -231,10 +231,178 @@ class TrueDataTickExportResponseMeta(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Option-chain export — REMOVED
+# Option-chain export
 # ---------------------------------------------------------------------------
-# The JWT-protected POST /api/v1/market-data/truedata/option-chain/export
-# endpoint (and its OptionChainSpec / TrueDataOptionChainExportRequest
-# schemas) has been removed. Option-chain access is now served by the
-# standalone no-auth FastAPI app in `app/standalone_truedata.py` (port 8086).
-# See the "Standalone TrueData option-chain API" section in the README.
+
+class OptionChainSpec(BaseModel):
+    """A single (underlying, expiry) pair to subscribe to.
+
+    The endpoint will start one option chain per spec, sample snapshots
+    at `snapshot_interval_seconds` cadence for `duration_seconds`, and
+    write one `.xls` file per spec into the returned ZIP.
+    """
+
+    underlying: str = Field(
+        ...,
+        min_length=1,
+        max_length=20,
+        description=(
+            "Underlying index or stock symbol — bare name, no expiry/strike "
+            "suffix. Examples: `NIFTY`, `BANKNIFTY`, `FINNIFTY`, `SENSEX`, "
+            "`MIDCPNIFTY`. Underlying is normalised (strip + uppercase) "
+            "before being forwarded to the TrueData SDK."
+        ),
+        examples=["NIFTY", "BANKNIFTY"],
+    )
+    expiry: date = Field(
+        ...,
+        description=(
+            "Expiry date (YYYY-MM-DD). Must be a valid trading expiry for "
+            "the underlying. NIFTY/BANKNIFTY/FINNIFTY/MIDCPNIFTY have "
+            "weekly Thursday expiries; SENSEX has weekly Tuesday expiries. "
+            "Monthly expiry is the last weekly expiry of the month."
+        ),
+        examples=["2026-07-30", "2026-08-27"],
+    )
+    chain_length: int = Field(
+        default=10,
+        ge=2,
+        le=100,
+        description=(
+            "Total number of strikes in the chain (centred on ATM). "
+            "The SDK generates `chain_length` strikes × 2 types (CE+PE) "
+            "= `2 × chain_length` option contracts. Trial accounts cap "
+            "live subscriptions at 50 contracts; `chain_length=10` → 20 "
+            "contracts per chain, so 2 chains is the safe trial ceiling. "
+            "Default 10."
+        ),
+        examples=[6, 10, 20],
+    )
+    bid_ask: bool = Field(
+        default=True,
+        description=(
+            "If True, include best bid/ask price + quantity columns in "
+            "the output. Default True. Disable to reduce row width."
+        ),
+    )
+    greek: bool = Field(
+        default=False,
+        description=(
+            "If True, request greeks (iv, delta, theta, gamma, vega, rho) "
+            "from the SDK and include them as 6 extra columns in the "
+            "output. Default False. Greeks require a TrueData plan with "
+            "option-greek entitlement (NOT included in trial)."
+        ),
+    )
+
+
+class TrueDataOptionChainExportRequest(BaseModel):
+    """Filter spec for `POST /api/v1/market-data/truedata/option-chain/export`.
+
+    Live option-chain streaming endpoint. Opens a real-time WebSocket to
+    TrueData, starts one option chain per entry in `chains`, samples
+    snapshots at `snapshot_interval_seconds` cadence for `duration_seconds`,
+    then disconnects and returns per-(underlying, expiry) `.xls` files
+    bundled into a ZIP.
+
+    Each `.xls` row is one strike × option-type × snapshot-time, with
+    20 base columns (snapshot_time, underlying, expiry, symbol, strike,
+    type, ltp, ltt, ltq, volume, price_change, price_change_perc, oi,
+    prev_oi, oi_change, oi_change_perc, bid, bid_qty, ask, ask_qty) plus
+    6 optional greek columns when any chain requests greeks.
+
+    IMPORTANT — Account entitlement:
+        Trial accounts get 'User Subscription Expired' on the option-chain
+        subscription request. The endpoint will work the moment the
+        account is upgraded to a plan with NSE F&O option-chain support
+        — no code changes required.
+    """
+
+    chains: list[OptionChainSpec] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "List of (underlying, expiry) pairs to subscribe to. Trial "
+            "accounts are effectively capped at 2 chains of length 10 "
+            "(50-contract subscription ceiling); paid plans can use up "
+            "to 5 chains (configurable via TRUEDATA_CHAIN_MAX_PAIRS). "
+            "Duplicate (underlying, expiry) pairs are rejected."
+        ),
+    )
+    duration_seconds: int = Field(
+        default=60,
+        ge=5,
+        le=300,
+        description=(
+            "Total capture window in seconds. Capped at 300 to avoid HTTP "
+            "proxy timeouts. Default 60. During active market hours with "
+            "active option trading, each 5-second snapshot yields ~20-40 "
+            "rows per chain (depending on `chain_length`)."
+        ),
+        examples=[30, 60, 120, 300],
+    )
+    snapshot_interval_seconds: int = Field(
+        default=5,
+        ge=1,
+        le=60,
+        description=(
+            "Time between snapshots in seconds. The endpoint samples each "
+            "chain's current state at this cadence for the full "
+            "`duration_seconds`. Default 5. Lower values = more snapshots "
+            "but more rows; raise to 10 or 15 for longer captures to "
+            "keep the .xls manageable."
+        ),
+        examples=[1, 5, 10, 15],
+    )
+    segment: Segment | None = Field(
+        default=Segment.NSE_FNO,
+        description=(
+            "Optional segment tag used for metadata/filename grouping only. "
+            "Symbol resolution still happens server-side at TrueData. "
+            "Defaults to 'NSE F&O' since option chains are NSE F&O "
+            "contracts (SENSEX option chains are BSE F&O — set explicitly "
+            "if requesting SENSEX)."
+        ),
+    )
+
+    @field_validator("chains")
+    @classmethod
+    def _normalize_chains(cls, v: list[OptionChainSpec]) -> list[OptionChainSpec]:
+        # Normalise underlying names (strip + uppercase). Reject duplicate
+        # (underlying, expiry) pairs — they'd produce identical .xls files
+        # in the ZIP and waste subscription slots.
+        seen: set[tuple[str, str]] = set()
+        cleaned: list[OptionChainSpec] = []
+        for spec in v:
+            u = spec.underlying.strip().upper()
+            if not u:
+                continue
+            key = (u, spec.expiry.isoformat())
+            if key in seen:
+                raise ValueError(
+                    f"Duplicate (underlying, expiry) pair: {u} / "
+                    f"{spec.expiry.isoformat()}. Each pair must be unique."
+                )
+            seen.add(key)
+            # Pydantic models are mutable; assign the normalised underlying.
+            spec.underlying = u
+            cleaned.append(spec)
+        if not cleaned:
+            raise ValueError("chains must contain at least one non-empty entry")
+        return cleaned
+
+
+class TrueDataOptionChainExportResponseMeta(BaseModel):
+    """JSON metadata for the option-chain export ZIP. The primary response
+    is the binary ZIP itself; this schema documents the `X-Export-*`
+    headers."""
+
+    chains: list[OptionChainSpec]
+    duration_seconds: int
+    snapshot_interval_seconds: int
+    segment: Segment | None
+    files: list[str]
+    total_rows: int
+    generated_at: str
+    capture_started_at: str
+    capture_ended_at: str

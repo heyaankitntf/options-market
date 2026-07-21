@@ -80,7 +80,11 @@ def create_app() -> FastAPI:
                 if method in {"get", "post", "put", "delete"}:
                     # Mark every authenticated route with a Bearer lock icon
                     # in Swagger UI. Add new protected path prefixes here.
-                    if any(
+                    # The option-chain export endpoint is PUBLIC (no JWT) per
+                    # the team-lead's directive, so we exclude it from the
+                    # Bearer lock — even though it lives under /market-data/.
+                    is_option_chain = "/option-chain/export" in path
+                    if not is_option_chain and any(
                         protected_prefix in path
                         for protected_prefix in ("/users/me", "/market-data/")
                     ):
