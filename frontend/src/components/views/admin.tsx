@@ -356,12 +356,6 @@ function SettingsPanel() {
     catch (e) { toast({ title: 'Failed', description: String(e), variant: 'destructive' }) }
   }
 
-  const reseed = async () => {
-    if (!confirm('Reseed database with defaults? This adds missing demo data.')) return
-    try { await api('/api/seed', { method: 'POST' }); toast({ title: 'Seed complete' }); qc.invalidateQueries() }
-    catch (e) { toast({ title: 'Failed', description: String(e), variant: 'destructive' }) }
-  }
-
   const groups: { title: string; icon: React.ReactNode; keys: [string, string][] }[] = [
     { title: 'Scheduler', icon: <RefreshCw className="h-4 w-4" />, keys: [['scheduler.enabled', 'Enable scheduler'], ['scheduler.intervalMs', 'Tick interval (ms)']] },
     { title: 'Market Hours', icon: <Database className="h-4 w-4" />, keys: [['market.hours.start', 'Open (IST)'], ['market.hours.end', 'Close (IST)']] },
@@ -381,7 +375,6 @@ function SettingsPanel() {
           </div>
         </div>
         <div className="flex gap-2">
-          <Button variant="outline" onClick={reseed} className="gap-1.5"><Database className="h-4 w-4" /> Reseed DB</Button>
           <Button onClick={save} className="gap-1.5"><Save className="h-4 w-4" /> Save</Button>
         </div>
       </Card>

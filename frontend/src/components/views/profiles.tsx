@@ -7,7 +7,7 @@ import {
   AlertCircle, RefreshCw, Loader2,
 } from 'lucide-react'
 import { api, type Profile, type FormulaTemplate } from '@/lib/api'
-import { SYMBOL_SPECS } from '@/lib/mock-market'
+import { SYMBOL_SPECS } from '@/lib/symbols'
 import { fmtNum, fmtDateTime, relTime } from '@/lib/format'
 import { SectionHeader, StatusBadge, EmptyState, MiniBar } from '@/components/ui/primitives'
 import { Card } from '@/components/ui/card'

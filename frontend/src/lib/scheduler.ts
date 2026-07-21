@@ -12,10 +12,34 @@
  */
 
 import { db } from './db'
-import { generateOptionChain } from './mock-market'
 import { processReport, DEFAULT_FORMULA } from './analytics'
 import { notifyChannels } from './notify'
 import type { OptionChainRow } from './analytics'
+
+/**
+ * Live data-source resolver.
+ *
+ * The scheduler MUST NOT fall back to mock-market.ts silently — that would
+ * write random data into RawSnapshot / Report and make it indistinguishable
+ * from real market data. Instead, each profile run calls whatever real
+ * data source is configured for the deployment.
+ *
+ * Wire your real source here (e.g. fetch from the Python backend's
+ * `/api/v1/market-data/truedata/option-chain/export`, or call the
+ * scraper-service on port 3030). Until this is wired up, profile runs
+ * will fail with a clear error rather than produce fake data.
+ */
+async function captureLiveOptionChain(
+  symbol: string,
+  expiry: string | null | undefined,
+): Promise<{ symbol: string; spotPrice: number; expiry: string; rows: OptionChainRow[] }> {
+  throw new Error(
+    `No live data source configured for symbol=${symbol}. ` +
+    `Wire captureLiveOptionChain() in src/lib/scheduler.ts to your real ` +
+    `source (e.g. the Python TrueData backend or the scraper-service on :3030). ` +
+    `Refusing to write mock data to the production database.`,
+  )
+}
 
 let timer: NodeJS.Timeout | null = null
 let running = false
@@ -77,11 +101,16 @@ export async function runProfile(profileId: string, triggeredBy = 'manual'): Pro
     if (profile.allStrikes) await log('info', 'browser', 'Enabled "All Strikes" toggle')
     await db.execution.update({ where: { id: execution.id }, data: { stage: 'export' } })
 
-    // Stage 3 — capture raw data (mock generator stands in for live scrape)
-    const snap = generateOptionChain(profile.symbol, profile.expiryDate ?? undefined)
+    // Stage 3 — capture raw data from the live data source (NEVER mock).
+    // captureLiveOptionChain() throws if no real source is wired up, so it
+    // is impossible for random test data to silently land in the DB.
+    const captureStarted = Date.now()
+    const snap = await captureLiveOptionChain(profile.symbol, profile.expiryDate ?? undefined)
+    const captureDurationMs = Date.now() - captureStarted
     await log('info', 'browser', `Captured ${snap.rows.length} strikes @ spot ${snap.spotPrice}`, {
       spot: snap.spotPrice,
       expiry: snap.expiry,
+      source: 'live',
     })
 
     const snapshot = await db.rawSnapshot.create({
@@ -92,7 +121,8 @@ export async function runProfile(profileId: string, triggeredBy = 'manual'): Pro
         spotPrice: snap.spotPrice,
         rowsJson: JSON.stringify(snap.rows),
         status: 'captured',
-        durationMs: Math.round(Math.random() * 1500 + 800),
+        durationMs: captureDurationMs,
+        source: 'live',
       },
     })
     await db.execution.update({ where: { id: execution.id }, data: { stage: 'process', snapshotId: snapshot.id } })
@@ -129,6 +159,7 @@ export async function runProfile(profileId: string, triggeredBy = 'manual'): Pro
         indicatorsJson: JSON.stringify(processed.indicators),
         summaryJson: JSON.stringify(processed.summary),
         reportHash: hash,
+        source: 'live',
       },
     })
     await db.execution.update({ where: { id: execution.id }, data: { stage: 'notify', reportId: report.id } })

@@ -1,41 +1,45 @@
 /**
- * Mock option-chain generator.
+ * ============================================================================
+ * ⚠️  TEST DATA ONLY — DO NOT USE IN PRODUCTION CODE PATHS  ⚠️
+ * ============================================================================
  *
- * Produces realistic, internally-consistent option chain snapshots around a
- * live-ish spot price for NIFTY / BANKNIFTY / SENSEX / FINNIFTY. Used as the
- * default data source when the icharts portal is unreachable or credentials
- * are absent, so the entire pipeline can be exercised end-to-end.
+ * This module generates SYNTHETIC option-chain snapshots for testing,
+ * local development, and demos. The data produced here is RANDOM — it
+ * does not represent any real market and has zero predictive value.
  *
- * Each call jitters the values so successive snapshots look like a moving
- * market — essential for trend & comparison features.
+ * HARD RULES:
+ *   1. Never import this module from production code paths (scheduler,
+ *      API routes that write to RawSnapshot/Report, the scraper-service,
+ *      etc.). Importing from a production path will cause random data
+ *      to be written to the database indistinguishable from real market
+ *      data. Use the live data source instead (e.g. the Python TrueData
+ *      backend or the scraper-service).
+ *   2. The only allowed callers are:
+ *        - Unit tests (under tests/ or *.test.ts)
+ *        - Storybook / component-preview fixtures
+ *        - Explicit developer-only CLI scripts guarded by NODE_ENV
+ *   3. Snapshots produced here MUST be tagged `source: 'mock'` when
+ *      written to the database, so they can be distinguished from real
+ *      data after the fact.
+ *
+ * Reference data (strike steps, label, base spot for UI hints) lives in
+ * `symbols.ts`. Import from there instead of here when you only need
+ * the symbol metadata.
+ * ============================================================================
  */
 
 import type { OptionChainRow } from './analytics'
+import { SYMBOL_SPECS, getSpec, defaultExpiry } from './symbols'
 
-export interface SymbolSpec {
-  symbol: string
-  baseSpot: number
-  strikeStep: number
-  strikesEitherSide: number
-  label: string
-}
-
-export const SYMBOL_SPECS: SymbolSpec[] = [
-  { symbol: 'NIFTY', baseSpot: 24850, strikeStep: 50, strikesEitherSide: 18, label: 'Nifty 50' },
-  { symbol: 'BANKNIFTY', baseSpot: 54200, strikeStep: 100, strikesEitherSide: 18, label: 'Bank Nifty' },
-  { symbol: 'SENSEX', baseSpot: 81300, strikeStep: 100, strikesEitherSide: 16, label: 'BSE Sensex' },
-  { symbol: 'FINNIFTY', baseSpot: 23400, strikeStep: 50, strikesEitherSide: 16, label: 'Fin Nifty' },
-  { symbol: 'MIDCPNIFTY', baseSpot: 12650, strikeStep: 25, strikesEitherSide: 16, label: 'Midcap Nifty' },
-]
-
-export function getSpec(symbol: string): SymbolSpec {
-  return SYMBOL_SPECS.find((s) => s.symbol === symbol) ?? SYMBOL_SPECS[0]
-}
+// Re-export for backwards compatibility with existing test imports.
+// New code should import directly from './symbols'.
+export { SYMBOL_SPECS, getSpec, defaultExpiry }
+export type { SymbolSpec } from './symbols'
 
 let spotDrift: Record<string, number> = {}
 SYMBOL_SPECS.forEach((s) => (spotDrift[s.symbol] = s.baseSpot))
 
-/** Advance the synthetic spot with a random walk. */
+/** Advance the synthetic spot with a random walk. TEST DATA ONLY. */
 export function nextSpot(symbol: string): number {
   const spec = getSpec(symbol)
   const cur = spotDrift[symbol] ?? spec.baseSpot
@@ -46,7 +50,7 @@ export function nextSpot(symbol: string): number {
   return Math.round(next)
 }
 
-/** Reset spot drift (used by tests / admin). */
+/** Reset spot drift (used by tests / admin). TEST DATA ONLY. */
 export function resetSpot(symbol?: string) {
   if (symbol) {
     spotDrift[symbol] = getSpec(symbol).baseSpot
@@ -69,8 +73,11 @@ export interface GeneratedSnapshot {
   spotPrice: number
   expiry: string
   rows: OptionChainRow[]
+  /** Always 'mock' — call sites MUST propagate this to the DB source column. */
+  source: 'mock'
 }
 
+/** Generate a synthetic option-chain snapshot. TEST DATA ONLY. */
 export function generateOptionChain(symbol: string, expiry?: string): GeneratedSnapshot {
   const spec = getSpec(symbol)
   const spot = nextSpot(symbol)
@@ -129,35 +136,9 @@ export function generateOptionChain(symbol: string, expiry?: string): GeneratedS
     spotPrice: spot,
     expiry: expiry ?? defaultExpiry(symbol),
     rows,
+    source: 'mock',
   }
 }
 
-/** Compute the next weekly expiry (Thursday) for the symbol. */
-export function defaultExpiry(symbol: string): string {
-  const now = new Date()
-  const day = now.getDay()
-  // Weekly expiry Thursday for NIFTY/BANKNIFTY; Sensex Tuesday
-  const target = symbol === 'SENSEX' ? 2 : 4
-  let diff = (target - day + 7) % 7
-  if (diff === 0) {
-    // today is expiry — if past 3:30pm, move to next week
-    if (now.getHours() >= 16) diff = 7
-  }
-  const d = new Date(now.getTime() + diff * 86400000)
-  return d.toISOString().slice(0, 10)
-}
-
-/** List upcoming expiries for a symbol. */
-export function upcomingExpiries(symbol: string, count = 6): { date: string; kind: string }[] {
-  const out: { date: string; kind: string }[] = []
-  const now = new Date()
-  const target = symbol === 'SENSEX' ? 2 : 4
-  let day = now.getDay()
-  let diff = (target - day + 7) % 7
-  if (diff === 0 && now.getHours() >= 16) diff = 7
-  for (let i = 0; i < count; i++) {
-    const d = new Date(now.getTime() + (diff + i * 7) * 86400000)
-    out.push({ date: d.toISOString().slice(0, 10), kind: i === 0 ? 'weekly' : i === count - 1 ? 'monthly' : 'weekly' })
-  }
-  return out
-}
+/** List upcoming expiries for a symbol. Re-exported from symbols.ts. */
+export { upcomingExpiries } from './symbols'

@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { SYMBOL_SPECS } from '@/lib/mock-market'
+import { SYMBOL_SPECS } from '@/lib/symbols'
 
 export const dynamic = 'force-dynamic'
 

@@ -15,12 +15,12 @@
  *   - session expiry detection + re-authentication
  *   - graceful selector fallbacks for UI changes
  *   - detailed per-action logging
- *   - mock-data fallback when Playwright browsers are not installed
- *     (so the pipeline always returns data, even in sandboxes)
  *
  * NOTE: Real Playwright requires `bunx playwright install chromium`.
- * The service auto-detects whether the browser is available and falls
- * back to a high-fidelity synthetic generator otherwise.
+ * If Playwright is not installed, /scrape returns HTTP 503 with a clear
+ * error message — it does NOT fall back to mock data. Returning mock
+ * data from a scraping endpoint would write random values into the
+ * production database indistinguishable from real market data.
  */
 
 import { createServer } from 'http'
@@ -38,57 +38,16 @@ function log(level: LogLevel, source: string, message: string, meta?: unknown) {
 }
 
 // ---------------------------------------------------------------------------
-// Symbol specifications (mirrors the main app's mock-market.ts)
+// Symbol specifications — reference data only (NOT a mock generator).
+// Used to compute default expiry dates and to validate requested symbols.
 // ---------------------------------------------------------------------------
-interface Spec { symbol: string; baseSpot: number; strikeStep: number; sides: number }
+interface Spec { symbol: string; strikeStep: number; label: string }
 const SPECS: Record<string, Spec> = {
-  NIFTY: { symbol: 'NIFTY', baseSpot: 24850, strikeStep: 50, sides: 18 },
-  BANKNIFTY: { symbol: 'BANKNIFTY', baseSpot: 54200, strikeStep: 100, sides: 18 },
-  SENSEX: { symbol: 'SENSEX', baseSpot: 81300, strikeStep: 100, sides: 16 },
-  FINNIFTY: { symbol: 'FINNIFTY', baseSpot: 23400, strikeStep: 50, sides: 16 },
-  MIDCPNIFTY: { symbol: 'MIDCPNIFTY', baseSpot: 12650, strikeStep: 25, sides: 16 },
-}
-
-// ---------------------------------------------------------------------------
-// Mock generator (fallback when Playwright is unavailable)
-// ---------------------------------------------------------------------------
-let drift: Record<string, number> = {}
-Object.keys(SPECS).forEach((s) => (drift[s] = SPECS[s].baseSpot))
-
-function gauss() {
-  let u = 0, v = 0
-  while (u === 0) u = Math.random()
-  while (v === 0) v = Math.random()
-  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v)
-}
-
-function generateChain(symbol: string, expiry?: string) {
-  const spec = SPECS[symbol] ?? SPECS.NIFTY
-  const cur = drift[symbol] ?? spec.baseSpot
-  const spot = Math.round(Math.max(spec.baseSpot * 0.9, Math.min(spec.baseSpot * 1.1, cur + (Math.random() - 0.48) * (spec.strikeStep / 4))))
-  drift[symbol] = spot
-  const atm = Math.round(spot / spec.strikeStep) * spec.strikeStep
-  const rows = []
-  const trendBias = (Math.sin(Date.now() / 600000) + 1) / 2
-  for (let i = -spec.sides; i <= spec.sides; i++) {
-    const strike = atm + i * spec.strikeStep
-    const dist = Math.abs(i)
-    const baseOi = Math.max(5000, 120000 * Math.exp(-dist / 6) * (0.6 + Math.random() * 0.8))
-    const ceOi = Math.round(baseOi * (i < 0 ? 0.7 : 1.15) * (0.8 + trendBias * 0.4))
-    const peOi = Math.round(baseOi * (i > 0 ? 0.7 : 1.15) * (0.8 + (1 - trendBias) * 0.4))
-    const smile = 10 + Math.abs(i) * 0.6
-    const ceIv = Math.max(6, Math.round((smile + gauss() * 1.2) * 10) / 10)
-    const peIv = Math.max(6, Math.round((smile + 1.5 + gauss() * 1.2) * 10) / 10)
-    const ceLtp = Math.max(0.5, Math.round((Math.max(0, spot - strike) + ceIv * spec.strikeStep * 0.04) * 100) / 100)
-    const peLtp = Math.max(0.5, Math.round((Math.max(0, strike - spot) + peIv * spec.strikeStep * 0.04) * 100) / 100)
-    rows.push({
-      strike, ceLtp, ceOi, ceChgOi: Math.round((Math.random() - 0.5) * ceOi * 0.25),
-      ceVolume: Math.round(ceOi * (0.05 + Math.random() * 0.4)), ceIv,
-      peLtp, peOi, peChgOi: Math.round((Math.random() - 0.5) * peOi * 0.25),
-      peVolume: Math.round(peOi * (0.05 + Math.random() * 0.4)), peIv,
-    })
-  }
-  return { symbol, spotPrice: spot, expiry: expiry ?? defaultExpiry(symbol), rows }
+  NIFTY: { symbol: 'NIFTY', strikeStep: 50, label: 'Nifty 50' },
+  BANKNIFTY: { symbol: 'BANKNIFTY', strikeStep: 100, label: 'Bank Nifty' },
+  SENSEX: { symbol: 'SENSEX', strikeStep: 100, label: 'BSE Sensex' },
+  FINNIFTY: { symbol: 'FINNIFTY', strikeStep: 50, label: 'Fin Nifty' },
+  MIDCPNIFTY: { symbol: 'MIDCPNIFTY', strikeStep: 25, label: 'Midcap Nifty' },
 }
 
 function defaultExpiry(symbol: string) {
@@ -195,10 +154,10 @@ async function scrapeWithPlaywright(opts: ScrapeOptions) {
     log('info', 'browser', `Captured ${rows.length} rows, spot=${spotPrice}`, { actions })
     return {
       symbol: opts.symbol,
-      spotPrice: spotPrice || SPECS[opts.symbol]?.baseSpot || 0,
+      spotPrice: spotPrice || 0,
       expiry: opts.expiry ?? defaultExpiry(opts.symbol),
       rows,
-      source: 'playwright',
+      source: 'icharts',
       actions,
     }
   } finally {
@@ -252,14 +211,16 @@ async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 3, backoffMs = 2
 }
 
 // ---------------------------------------------------------------------------
-// Main scrape orchestrator
+// Main scrape orchestrator — REAL DATA ONLY, never falls back to mock.
 // ---------------------------------------------------------------------------
 async function scrape(opts: ScrapeOptions) {
   const hasPw = await checkPlaywright()
   if (!hasPw) {
-    log('info', 'browser', 'Using mock generator (Playwright unavailable)')
-    const data = generateChain(opts.symbol, opts.expiry)
-    return { ...data, source: 'mock', actions: ['mock-generate'] }
+    throw new Error(
+      'Playwright chromium is not installed — cannot scrape real option-chain data. ' +
+      'Install with: bunx playwright install chromium  (then re-run). ' +
+      'Refusing to return mock data; that would write random values into the production database.',
+    )
   }
   return withRetry(() => scrapeWithPlaywright(opts))
 }
@@ -296,9 +257,13 @@ const server = createServer(async (req, res) => {
       const data = await scrape(opts)
       res.end(JSON.stringify(data))
     } catch (e) {
-      log('error', 'browser', `Scrape failed: ${String(e)}`)
-      res.statusCode = 500
-      res.end(JSON.stringify({ error: String(e) }))
+      const message = e instanceof Error ? e.message : String(e)
+      log('error', 'browser', `Scrape failed: ${message}`)
+      // 503 when Playwright is missing — callers can distinguish infrastructure
+      // issues from genuine scrape failures (which would be 500).
+      const status = /Playwright chromium is not installed/.test(message) ? 503 : 500
+      res.statusCode = status
+      res.end(JSON.stringify({ error: message }))
     }
     return
   }
