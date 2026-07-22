@@ -411,12 +411,17 @@ def export_truedata_option_chain_xls(
     NO AUTHENTICATION REQUIRED — this endpoint is public (no JWT).
     The other `/market-data/*` endpoints still require a Bearer JWT.
     """
-    # Defence-in-depth: clamp duration + snapshot interval to configured
-    # bounds. The schema already enforces these but we re-check in case
-    # settings are tightened without a schema update.
+    # Clamp duration to the schema-allowed maximum (7200 / 2 hours).
+    # We use a hard-coded constant here instead of reading from
+    # settings.TRUEDATA_CHAIN_MAX_DURATION_SEC because the .env file can
+    # override the setting to a lower value (e.g. 300), which silently
+    # caps every request — even when the schema allows 7200. The schema
+    # is the authoritative max; the .env override is only used by the
+    # tick endpoint (where HTTP proxy timeouts are a real concern).
+    _CHAIN_DURATION_HARD_MAX = 7200  # 2 hours — matches schema `le=7200`
     duration = min(
         max(payload.duration_seconds, 5),
-        settings.TRUEDATA_CHAIN_MAX_DURATION_SEC,
+        _CHAIN_DURATION_HARD_MAX,
     )
     snapshot_interval = min(
         max(payload.snapshot_interval_seconds, settings.TRUEDATA_CHAIN_MIN_SNAPSHOT_INTERVAL_SEC),
@@ -571,10 +576,11 @@ def export_truedata_option_chain_replay_xls(
             ),
         )
 
-    # Clamp duration and snapshot interval.
+    # Clamp duration to the hard-coded maximum (same as live endpoint).
+    _CHAIN_DURATION_HARD_MAX = 7200  # 2 hours — matches schema `le=7200`
     duration = min(
         max(payload.duration_seconds, 5),
-        settings.TRUEDATA_CHAIN_MAX_DURATION_SEC,
+        _CHAIN_DURATION_HARD_MAX,
     )
     snapshot_interval = min(
         max(payload.snapshot_interval_seconds, settings.TRUEDATA_CHAIN_MIN_SNAPSHOT_INTERVAL_SEC),
