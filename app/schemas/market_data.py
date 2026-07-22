@@ -309,15 +309,20 @@ class TrueDataOptionChainExportRequest(BaseModel):
     bundled into a ZIP.
 
     Each `.xls` row is one strike x option-type x snapshot-time, with
-    23 base columns enriched from both the option-chain DataFrame and the
+    25 base columns enriched from both the option-chain DataFrame and the
     full tick-level `live_data` dict:
 
         Symbol ID, Date Time, LTP, LTQ, ATP, TTQ,
         Open, High, Low, Prev Close,
-        OI, Prev Open Int Close, Day's Turnover,
+        OI, Prev Open Int Close, OI Chg, LTP Chg, Day's Turnover,
         Special Tag, Tick Sequence No,
         Bid, Bid Qty, Ask, Ask Qty,
         Underlying, Expiry, Strike, Type
+
+    **OI Chg** = OI - Prev Open Int Close (change in open interest vs
+    previous session's closing OI).
+    **LTP Chg** = LTP - Prev Close (price change vs previous session's
+    closing price).
 
     Plus 6 optional greek columns (IV, Delta, Theta, Gamma, Vega, Rho)
     when any chain requests greeks.

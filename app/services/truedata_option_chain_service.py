@@ -64,10 +64,15 @@ Each row in every .xls is one strike × snapshot-time:
 
     Symbol ID, Symbol, Date Time, LTP, LTQ, ATP, TTQ,
     Open, High, Low, Prev Close,
-    OI, Prev Open Int Close, Day's Turnover,
+    OI, Prev Open Int Close, OI Chg, LTP Chg, Day's Turnover,
     Special Tag, Tick Sequence No,
     Bid, Bid Qty, Ask, Ask Qty,
     Underlying, Expiry, Strike, Type
+
+**OI Chg** = OI - Prev Open Int Close (change in open interest vs
+previous session's closing OI).
+**LTP Chg** = LTP - Prev Close (price change vs previous session's
+closing price).
 
 This matches the spec the user requested exactly. The `Type` column is
 always present (will be "CE" in the CE file, "PE" in the PE file) so
@@ -114,7 +119,7 @@ class TrueDataError(RuntimeError):
 # Fields that represent a meaningful data change.  When none of these differ
 # from the previously written value for the same symbol, the row is a
 # duplicate and is silently dropped.
-_CHANGE_DETECT_KEYS: tuple[str, ...] = ("LTP", "Bid", "Ask", "OI", "Date Time")
+_CHANGE_DETECT_KEYS: tuple[str, ...] = ("LTP", "Bid", "Ask", "OI", "OI Chg", "LTP Chg", "Date Time")
 
 
 class _SymbolChangeTracker:
@@ -165,7 +170,7 @@ class _SymbolChangeTracker:
 # Matches the user's requested column order exactly:
 # Symbol ID, Date Time (Timestamp), LTP, LTQ, ATP, TTQ,
 # Open, High, Low, Prev Close,
-# OI, Prev Open Int Close, Day's Turnover,
+# OI, Prev Open Int Close, OI Chg, LTP Chg, Day's Turnover,
 # Special Tag, Tick Sequence No,
 # Bid, Bid Qty, Ask, Ask Qty
 #
@@ -185,6 +190,8 @@ OPTION_CHAIN_COLUMNS: list[str] = [
     "Prev Close",
     "OI",
     "Prev Open Int Close",
+    "OI Chg",
+    "LTP Chg",
     "Day's Turnover",
     "Special Tag",
     "Tick Sequence No",
@@ -314,6 +321,12 @@ def _enrich_row_from_live_data(
         row["Prev Close"] = float(_safe_attr(live_entry, "prev_day_close", 0.0) or 0.0)
         row["OI"] = int(_safe_attr(live_entry, "oi", chain_oi) or chain_oi or 0)
         row["Prev Open Int Close"] = int(_safe_attr(live_entry, "prev_day_oi", chain_prev_oi) or chain_prev_oi or 0)
+        oi_val = row["OI"]
+        prev_oi_val = row["Prev Open Int Close"]
+        ltp_val = row["LTP"]
+        prev_close_val = row["Prev Close"]
+        row["OI Chg"] = int(oi_val - prev_oi_val) if oi_val is not None and prev_oi_val is not None else None
+        row["LTP Chg"] = float(ltp_val - prev_close_val) if ltp_val is not None and prev_close_val is not None else None
         row["Day's Turnover"] = float(_safe_attr(live_entry, "turnover", 0.0) or 0.0)
         row["Special Tag"] = str(_safe_attr(live_entry, "special_tag", "") or "")
         row["Tick Sequence No"] = int(_safe_attr(live_entry, "tick_seq", 0) or 0)
@@ -337,6 +350,12 @@ def _enrich_row_from_live_data(
         row["Prev Close"] = None
         row["OI"] = _to_native_or_none(chain_oi)
         row["Prev Open Int Close"] = _to_native_or_none(chain_prev_oi)
+        oi_val = row["OI"]
+        prev_oi_val = row["Prev Open Int Close"]
+        ltp_val = row["LTP"]
+        prev_close_val = row["Prev Close"]
+        row["OI Chg"] = (int(oi_val - prev_oi_val) if oi_val is not None and prev_oi_val is not None else None)
+        row["LTP Chg"] = (float(ltp_val - prev_close_val) if ltp_val is not None and prev_close_val is not None else None)
         row["Day's Turnover"] = None
         row["Special Tag"] = ""
         row["Tick Sequence No"] = None
@@ -551,6 +570,8 @@ def _enrich_row_from_rest_data(
         "Prev Close": float(record.get("prev_close", 0) or 0),
         "OI": int(record.get("oi", 0) or 0),
         "Prev Open Int Close": int(record.get("prev_oi", 0) or 0),
+        "OI Chg": int(record.get("oi", 0) or 0) - int(record.get("prev_oi", 0) or 0),
+        "LTP Chg": float(record.get("ltp", 0) or 0) - float(record.get("prev_close", 0) or 0),
         "Day's Turnover": float(record.get("turnover", 0) or 0),
         "Special Tag": str(record.get("special_tag", "") or ""),
         "Tick Sequence No": int(record.get("tick_seq", 0) or 0),

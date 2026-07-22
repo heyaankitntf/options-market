@@ -368,16 +368,19 @@ def export_truedata_option_chain_xls(
     cadence for `duration_seconds`, then return the captured rows as a ZIP
     of legacy `.xls` files (one per (underlying, expiry) pair).
 
-    Each `.xls` row is one strike x snapshot-time, with 23 base columns
+    Each `.xls` row is one strike x snapshot-time, with 25 base columns
     enriched from both the option-chain DataFrame and the full tick-level
     `live_data` dict:
 
         Symbol ID, Date Time, LTP, LTQ, ATP, TTQ,
         Open, High, Low, Prev Close,
-        OI, Prev Open Int Close, Day's Turnover,
+        OI, Prev Open Int Close, OI Chg, LTP Chg, Day's Turnover,
         Special Tag, Tick Sequence No,
         Bid, Bid Qty, Ask, Ask Qty,
         Underlying, Expiry, Strike, Type
+
+    OI Chg = OI - Prev Open Int Close (open interest change).
+    LTP Chg = LTP - Prev Close (price change).
 
     Plus 6 optional greek columns (IV, Delta, Theta, Gamma, Vega, Rho)
     when any chain requests `greek=true`.
@@ -540,11 +543,11 @@ def export_truedata_option_chain_replay_xls(
     evenings/weekends without waiting for live market hours.
 
     The output format is identical to the live option-chain export:
-    separate CE/PE .xls files with all 24 columns (Symbol ID, Symbol,
+    separate CE/PE .xls files with all 26 columns (Symbol ID, Symbol,
     Date Time, LTP, LTQ, ATP, TTQ, Open, High, Low, Prev Close, OI,
-    Prev Open Int Close, Day's Turnover, Special Tag, Tick Sequence No,
-    Bid, Bid Qty, Ask, Ask Qty, Underlying, Expiry, Strike, Type) plus
-    optional greek columns.
+    Prev Open Int Close, OI Chg, LTP Chg, Day's Turnover, Special Tag,
+    Tick Sequence No, Bid, Bid Qty, Ask, Ask Qty, Underlying, Expiry,
+    Strike, Type) plus optional greek columns.
 
     If the replay WebSocket doesn't capture data, automatically falls back
     to TrueData's REST API (`getOptionChain` endpoint).
