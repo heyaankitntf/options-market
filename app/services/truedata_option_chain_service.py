@@ -535,50 +535,169 @@ def _parse_type_from_symbol(symbol_name: str) -> str:
     return ""
 
 
+# TrueData REST API getOptionChain returns records in **list format**
+# (arrays), NOT dicts.  Each record is a 23-element array.  The field
+# mapping below converts index positions to our canonical dict keys so
+# that _enrich_row_from_rest_data can work uniformly regardless of format.
+#
+# Verified against the live trial account (2026-07-22):
+#   [0]  symbol_id          int     302837453
+#   [1]  symbol             str     "RELIANCE2607281000CE"
+#   [2]  type               str     "CE" / "PE"
+#   [3]  segment            str     "" (empty)
+#   [4]  exchange           str     "NSE"
+#   [5]  lot_size           int     500
+#   [6]  strike             float   1000.0, 1290.0  ← KEY FIELD
+#   [7]  expiry             str     "2026-07-28T00:00:00"
+#   [8]  short_code         str     "RELIANCEG61000"
+#   [9]  symbol_again       str     "RELIANCE2607281000CE"
+#   [10] ltp                int     0 (0 during off-hours; real price during market)
+#   [11] best_bid_price     None    null (null when no bids)
+#   [12] best_ask_price     None    null (null when no asks)
+#   [13] timestamp          str     "0001-01-01T00:00:00" (dummy off-hours)
+#   [14] oi                 int     0
+#   [15] volume             int     0
+#   [16] atp                float   0.0
+#   [17] prev_oi            None    null (prev day OI)
+#   [18] day_open           int     0
+#   [19] day_high           None    null
+#   [20] day_low            None    null
+#   [21] turnover           int     0
+#   [22] flag               bool    False
+#
+# During active market hours, indices 10-21 contain real non-zero data.
+_REST_LIST_FIELD_MAP: dict[int, str] = {
+    0: "symbol_id",
+    1: "symbol",
+    2: "type",
+    6: "strike",
+    7: "expiry",
+    10: "ltp",
+    11: "bid",
+    12: "ask",
+    13: "timestamp",
+    14: "oi",
+    15: "volume",
+    16: "atp",
+    17: "prev_oi",
+    18: "day_open",
+    19: "day_high",
+    20: "day_low",
+    21: "turnover",
+}
+
+
+def _normalize_rest_record(record: Any) -> dict[str, Any]:
+    """Convert a REST API record (list or dict) to a uniform dict.
+
+    The TrueData getOptionChain endpoint returns records as **arrays**
+    (lists), not dicts.  This function converts them to dicts using
+    `_REST_LIST_FIELD_MAP` so downstream code can use `.get()` uniformly.
+
+    If the record is already a dict, it is returned unchanged (with an
+    added "strike" key from a direct "strike" field if present).
+    """
+    if isinstance(record, dict):
+        # Dict format — ensure "strike" is present from direct field.
+        if "strike" not in record and "Strike" not in record:
+            symbol_name = str(record.get("symbol", ""))
+            record["strike"] = _parse_strike_from_symbol(symbol_name)
+        return record
+
+    if isinstance(record, list):
+        mapped: dict[str, Any] = {}
+        for idx, key in _REST_LIST_FIELD_MAP.items():
+            if idx < len(record):
+                mapped[key] = record[idx]
+        # Fill in derived / fallback fields not directly in the array.
+        # "prev_close" — TrueData's REST list format doesn't have a
+        # dedicated prev_close index.  Fall back to None; the row builder
+        # will compute LTP Chg as None when prev_close is unknown.
+        mapped["prev_close"] = None
+        # "bid_qty" and "ask_qty" — not available in list format.
+        mapped["bid_qty"] = None
+        mapped["ask_qty"] = None
+        # "ltq" — not separate from volume in list format; use volume.
+        mapped["ltq"] = mapped.get("volume", 0)
+        # "prev_day_oi" — use prev_oi (index 17).
+        mapped["prev_oi"] = mapped.get("prev_oi", None)
+        # "special_tag" and "tick_seq" — not in REST response.
+        mapped["special_tag"] = ""
+        mapped["tick_seq"] = None
+        # "symbol_id" — ensure int.
+        mapped["symbol_id"] = int(mapped.get("symbol_id", 0) or 0)
+        # "type" — ensure string.
+        mapped["type"] = str(mapped.get("type", ""))
+        return mapped
+
+    # Unknown format — return empty dict so downstream code gets None values.
+    logger.warning("Unexpected REST record format: %s", type(record).__name__)
+    return {}
+
+
 def _enrich_row_from_rest_data(
-    record: dict[str, Any],
+    record: Any,
     underlying: str,
     expiry_str: str,
     snapshot_time: datetime,
 ) -> dict[str, Any]:
     """Build a complete row from a REST API getOptionChain record.
 
-    The REST API returns per-contract data with fields that map to our
-    output schema. Not all 19 fields are available from the REST API;
-    missing ones are set to None/0.
+    Handles **both** list-format and dict-format records.  The TrueData
+    REST API returns arrays (lists of 23 elements), but we normalise them
+    to dicts via `_normalize_rest_record` so all downstream `.get()` calls
+    work uniformly.
 
-    Typical REST API record fields:
-      symbol, ltp, volume, oi, prev_oi, bid, bid_qty, ask, ask_qty,
-      atp, day_open, day_high, day_low, prev_close, turnover, ltq,
-      symbol_id, timestamp, etc.
+    The REST API provides a **complete** option chain (all strikes, not
+    just chain_length).  The strike value comes from the direct field
+    (index 6 / "strike" key) as a proper float — no symbol-name parsing
+    needed, so strikes are always complete and accurate.
+
+    Not all fields are available from the REST API; missing ones are set
+    to None/0.
     """
-    symbol_name = str(record.get("symbol", ""))
-    strike = _parse_strike_from_symbol(symbol_name)
-    option_type = _parse_type_from_symbol(symbol_name)
+    d = _normalize_rest_record(record)
+    symbol_name = str(d.get("symbol", ""))
+    # Use the direct strike value from the REST response (index 6) —
+    # much more reliable than parsing from symbol name.
+    strike = d.get("strike")
+    if strike is None:
+        strike = _parse_strike_from_symbol(symbol_name)
+    option_type = str(d.get("type", "")) or _parse_type_from_symbol(symbol_name)
+
+    oi_val = int(d.get("oi", 0) or 0)
+    prev_oi_val = d.get("prev_oi")
+    prev_oi_int = int(prev_oi_val or 0) if prev_oi_val is not None else None
+    ltp_val = float(d.get("ltp", 0) or 0)
+    prev_close_val = d.get("prev_close")
+    prev_close_float = float(prev_close_val or 0) if prev_close_val is not None else None
+
+    oi_chg = (oi_val - prev_oi_int) if prev_oi_int is not None else None
+    ltp_chg = (ltp_val - prev_close_float) if prev_close_float is not None else None
 
     row: dict[str, Any] = {
-        "Symbol ID": int(record.get("symbol_id", 0) or 0),
+        "Symbol ID": int(d.get("symbol_id", 0) or 0),
         "Symbol": symbol_name,
-        "Date Time": record.get("timestamp", snapshot_time) or snapshot_time,
-        "LTP": float(record.get("ltp", 0) or 0),
-        "LTQ": int(record.get("ltq", 0) or 0),
-        "ATP": float(record.get("atp", 0) or 0),
-        "TTQ": float(record.get("volume", 0) or 0),
-        "Open": float(record.get("day_open", 0) or 0),
-        "High": float(record.get("day_high", 0) or 0),
-        "Low": float(record.get("day_low", 0) or 0),
-        "Prev Close": float(record.get("prev_close", 0) or 0),
-        "OI": int(record.get("oi", 0) or 0),
-        "Prev Open Int Close": int(record.get("prev_oi", 0) or 0),
-        "OI Chg": int(record.get("oi", 0) or 0) - int(record.get("prev_oi", 0) or 0),
-        "LTP Chg": float(record.get("ltp", 0) or 0) - float(record.get("prev_close", 0) or 0),
-        "Day's Turnover": float(record.get("turnover", 0) or 0),
-        "Special Tag": str(record.get("special_tag", "") or ""),
-        "Tick Sequence No": int(record.get("tick_seq", 0) or 0),
-        "Bid": float(record.get("bid", 0) or 0),
-        "Bid Qty": int(record.get("bid_qty", 0) or 0),
-        "Ask": float(record.get("ask", 0) or 0),
-        "Ask Qty": int(record.get("ask_qty", 0) or 0),
+        "Date Time": d.get("timestamp", snapshot_time) or snapshot_time,
+        "LTP": ltp_val,
+        "LTQ": int(d.get("ltq", 0) or 0),
+        "ATP": float(d.get("atp", 0) or 0),
+        "TTQ": float(d.get("volume", 0) or 0),
+        "Open": float(d.get("day_open", 0) or 0),
+        "High": float(d.get("day_high", 0) or 0) if d.get("day_high") is not None else None,
+        "Low": float(d.get("day_low", 0) or 0) if d.get("day_low") is not None else None,
+        "Prev Close": prev_close_float,
+        "OI": oi_val,
+        "Prev Open Int Close": prev_oi_int,
+        "OI Chg": oi_chg,
+        "LTP Chg": ltp_chg,
+        "Day's Turnover": float(d.get("turnover", 0) or 0),
+        "Special Tag": str(d.get("special_tag", "") or ""),
+        "Tick Sequence No": d.get("tick_seq"),
+        "Bid": float(d.get("bid", 0) or 0) if d.get("bid") is not None else None,
+        "Bid Qty": d.get("bid_qty"),
+        "Ask": float(d.get("ask", 0) or 0) if d.get("ask") is not None else None,
+        "Ask Qty": d.get("ask_qty"),
         "Underlying": underlying,
         "Expiry": expiry_str,
         "Strike": strike,
