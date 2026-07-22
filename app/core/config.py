@@ -77,9 +77,11 @@ class Settings(BaseSettings):
     # Per-request capture duration for the option-chain export endpoint.
     # The endpoint samples the live option chain at `snapshot_interval_seconds`
     # cadence for `duration_seconds`, so a 60s/5s request yields ~12 snapshots
-    # per (underlying, expiry) pair. Capped at 300s to avoid HTTP proxy
-    # timeouts (same ceiling as the tick export).
-    TRUEDATA_CHAIN_MAX_DURATION_SEC: int = 300
+    # per (underlying, expiry) pair. Capped at 7200s (2 hours) to allow
+    # extended intraday capture. Per-symbol change detection suppresses
+    # duplicate rows, so longer captures only add rows when data actually
+    # changes — keeping the .xls compact even for multi-hour runs.
+    TRUEDATA_CHAIN_MAX_DURATION_SEC: int = 7200
     TRUEDATA_CHAIN_DEFAULT_DURATION_SEC: int = 60
     TRUEDATA_CHAIN_DEFAULT_SNAPSHOT_INTERVAL_SEC: int = 5
     TRUEDATA_CHAIN_MIN_SNAPSHOT_INTERVAL_SEC: int = 1
