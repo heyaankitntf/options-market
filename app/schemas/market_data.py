@@ -352,14 +352,17 @@ class TrueDataOptionChainExportRequest(BaseModel):
     duration_seconds: int = Field(
         default=60,
         ge=5,
-        le=300,
+        le=7200,
         description=(
-            "Total capture window in seconds. Capped at 300 to avoid HTTP "
-            "proxy timeouts. Default 60. During active market hours with "
-            "active option trading, each 5-second snapshot yields ~20-40 "
-            "rows per chain (depending on `chain_length`)."
+            "Total capture window in seconds. Maximum 7200 (2 hours). "
+            "Per-symbol change detection ensures only rows with actual "
+            "data changes (LTP, Bid, Ask, OI, timestamp) are written, "
+            "so longer captures stay compact. Default 60. During active "
+            "market hours with active option trading, each 5-second "
+            "snapshot yields ~20-40 rows per chain (depending on "
+            "`chain_length`)."
         ),
-        examples=[30, 60, 120, 300],
+        examples=[30, 60, 120, 300, 1800, 3600, 7200],
     )
     snapshot_interval_seconds: int = Field(
         default=5,
